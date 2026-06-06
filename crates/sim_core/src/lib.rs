@@ -157,10 +157,39 @@ pub enum Order {
     Hold,
 }
 
-pub const DAMAGE_PER_TICK: f32 = 14.0;
-pub const CHARGE_BONUS: f32 = 10.0;
 pub const HOLD_REDUCTION: f32 = 0.5;
 pub const VISION: i32 = 8;
+/// A skirmisher within this many hexes of an enemy backs off instead of meleeing.
+pub const KITE_THRESHOLD: i32 = 2;
+
+/// Hexes a unit can strike: melee = 1, skirmishers shoot at range.
+pub fn attack_range(kind: Kind) -> i32 {
+    match kind {
+        Kind::Skirmisher => 3,
+        _ => 1,
+    }
+}
+
+/// Base damage dealt per tick to a target in range.
+pub fn attack_damage(kind: Kind) -> f32 {
+    match kind {
+        Kind::Infantry => 14.0,
+        Kind::Cavalry => 11.0,
+        Kind::Skirmisher => 8.0,
+    }
+}
+
+/// Extra melee damage while charging (cavalry hits hardest; skirmishers never).
+pub fn charge_bonus(kind: Kind, order: Order) -> f32 {
+    if order != Order::Charge {
+        return 0.0;
+    }
+    match kind {
+        Kind::Cavalry => 16.0,
+        Kind::Infantry => 8.0,
+        Kind::Skirmisher => 0.0,
+    }
+}
 
 pub fn max_hp(kind: Kind) -> f32 {
     match kind {
@@ -246,25 +275,27 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
     }
 }
 
-/// Each unit damages every adjacent enemy; charging attackers hit harder.
+/// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
+/// within missile range. Charging melee attackers hit harder.
 pub fn combat(
-    units: Query<(&Hex, &Team, &Group)>,
+    units: Query<(&Hex, &Team, &Kind, &Group)>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     mut dmg: ResMut<DamageBuffer>,
 ) {
-    for (hex, team, group) in &units {
-        let bonus = if orders.get(*team, group.0) == Order::Charge {
-            CHARGE_BONUS
-        } else {
-            0.0
-        };
-        for n in hex.neighbors() {
-            if let Some((enemy, eteam)) = idx.at(n) {
-                if eteam != *team {
-                    *dmg.0.entry(enemy).or_insert(0.0) += DAMAGE_PER_TICK + bonus;
+    for (hex, team, kind, group) in &units {
+        let order = orders.get(*team, group.0);
+        let amount = attack_damage(*kind) + charge_bonus(*kind, order);
+        if attack_range(*kind) == 1 {
+            for n in hex.neighbors() {
+                if let Some((enemy, eteam)) = idx.at(n) {
+                    if eteam != *team {
+                        *dmg.0.entry(enemy).or_insert(0.0) += amount;
+                    }
                 }
             }
+        } else if let Some(enemy) = nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind)) {
+            *dmg.0.entry(enemy).or_insert(0.0) += amount;
         }
     }
 }
@@ -317,8 +348,23 @@ pub fn movement(
         }
 
         let from = *hex;
+        let enemy = nearest_enemy(&idx, from, *team);
 
-        // Adjacent to an enemy → engaged, hold position (still fights via combat).
+        // Skirmishers kite: back off when an enemy gets close, shooting via combat.
+        if *kind == Kind::Skirmisher {
+            if let Some(e) = enemy {
+                if from.distance(e) <= KITE_THRESHOLD {
+                    if let Some(n) = kite_step(from, e, &terrain, &idx, &reserved) {
+                        reserved.insert((n.q, n.r));
+                        *hex = n;
+                        next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Melee: adjacent to an enemy → engaged, hold position (still fights).
         let fighting = from
             .neighbors()
             .iter()
@@ -327,7 +373,6 @@ pub fn movement(
             continue;
         }
 
-        let enemy = nearest_enemy(&idx, from, *team);
         let goal = enemy.unwrap_or_else(|| enemy_line(*team));
 
         // Prefer the A*-routed next hex toward a visible enemy; fall back to a
@@ -411,6 +456,54 @@ fn nearest_enemy(idx: &SpatialIndex, from: Hex, team: Team) -> Option<Hex> {
         }
     }
     best
+}
+
+/// Entity of the closest enemy within `range` (for ranged attacks).
+fn nearest_enemy_entity(idx: &SpatialIndex, from: Hex, team: Team, range: i32) -> Option<Entity> {
+    let mut best = None;
+    let mut best_d = i32::MAX;
+    for dq in -range..=range {
+        for dr in -range..=range {
+            let h = Hex::new(from.q + dq, from.r + dr);
+            let d = from.distance(h);
+            if d == 0 || d > range {
+                continue;
+            }
+            if let Some((e, t)) = idx.at(h) {
+                if t != team && d < best_d {
+                    best_d = d;
+                    best = Some(e);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Free, passable neighbor that moves away from `enemy` (skirmisher kiting).
+fn kite_step(
+    from: Hex,
+    enemy: Hex,
+    terrain: &TerrainMap,
+    idx: &SpatialIndex,
+    reserved: &HashSet<(i32, i32)>,
+) -> Option<Hex> {
+    let mut best: Option<Hex> = None;
+    let mut best_d = -1;
+    for n in from.neighbors() {
+        if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
+            continue;
+        }
+        let d = n.distance(enemy);
+        if d > best_d {
+            best_d = d;
+            best = Some(n);
+        }
+    }
+    match best {
+        Some(n) if n.distance(enemy) >= from.distance(enemy) => Some(n),
+        _ => None,
+    }
 }
 
 /// Fallback march target: the far side of the field the enemy came from.
@@ -570,6 +663,31 @@ mod tests {
             dmg_on(Terrain::Hill) < dmg_on(Terrain::Plains),
             "defending on a hill should reduce damage taken"
         );
+    }
+
+    #[test]
+    fn skirmishers_shoot_at_range_melee_does_not() {
+        let dmg_to_enemy = |kind: Kind| -> f32 {
+            let mut w = fresh_world();
+            w.spawn(unit(Team::Red, kind, Hex::new(0, 0), 1));
+            let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(3, 0), 1)).id();
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(blue).map(|h| h.0).unwrap_or(0.0)
+        };
+        assert!(dmg_to_enemy(Kind::Skirmisher) > 0.0, "skirmisher should hit at range 3");
+        assert_eq!(dmg_to_enemy(Kind::Infantry), 0.0, "melee must not hit at range 3");
+    }
+
+    #[test]
+    fn skirmishers_kite_from_adjacent_enemies() {
+        let mut w = fresh_world();
+        let sk = w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+
+        step(&mut w);
+
+        let h = *w.get::<Hex>(sk).expect("skirmisher alive");
+        assert!(h.distance(Hex::new(1, 0)) >= 2, "skirmisher should kite away, at {h:?}");
     }
 
     #[test]

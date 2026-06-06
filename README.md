@@ -4,11 +4,14 @@ Prototipo en Bevy del motor del juego fusionado. Valida el stack y el diseño EC
 de la batalla del [blueprint](../hex-tactics/.worktrees/feature-presentation/docs/rust-engine-research/00-ENGINE-BLUEPRINT.md)
 antes de comprometer el juego entero.
 
-## Qué hace (Fase 2)
+## Qué hace (Fase 3)
 
 - 280 unidades (140 rojas vs 140 azules) sobre un **mapa hexagonal con terreno**
   (llanura / bosque / colina / montaña / agua) avanzan, lo rodean, chocan y un
   bando es aniquilado.
+- **Tres tipos de unidad** con rol distinto: **infantry** (tanque, melee),
+  **cavalry** (rápida, carga fuerte; al frente), **skirmisher** (dispara a distancia
+  y *kitea* — se aleja del cuerpo a cuerpo; en retaguardia). Coloreadas por tipo.
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
@@ -18,7 +21,7 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  7 tests).
+  10 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 

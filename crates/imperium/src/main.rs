@@ -109,15 +109,24 @@ fn setup(
     }
 
     let mesh = meshes.add(RegularPolygon::new(HEX_SIZE * 0.6, 6));
-    let red = materials.add(Color::srgb(0.92, 0.30, 0.30));
-    let blue = materials.add(Color::srgb(0.34, 0.52, 0.96));
+    // One material per (team, kind): team hue, brightness by kind.
+    let mut umat: Vec<(Team, Kind, Handle<ColorMaterial>)> = Vec::new();
+    for team in [Team::Red, Team::Blue] {
+        for kind in [Kind::Infantry, Kind::Cavalry, Kind::Skirmisher] {
+            umat.push((team, kind, materials.add(unit_color(team, kind))));
+        }
+    }
+    let mat_for = |team, kind| umat.iter().find(|(t, k, _)| *t == team && *k == kind).unwrap().2.clone();
 
     // Red block on the left, Blue block on the right; a gap in the middle.
+    // Cavalry forms the front, infantry the centre, skirmishers the rear.
     for col in 0..COLS {
         for row in 0..ROWS {
             let r = row - ROWS / 2;
-            spawn_unit(&mut commands, &mesh, &red, Team::Red, Hex::new(-15 + col, r));
-            spawn_unit(&mut commands, &mesh, &blue, Team::Blue, Hex::new(6 + col, r));
+            let (rq, bq) = (-15 + col, 6 + col);
+            let (rk, bk) = (kind_for(rq.abs()), kind_for(bq.abs()));
+            spawn_unit(&mut commands, &mesh, &mat_for(Team::Red, rk), Team::Red, rk, Hex::new(rq, r));
+            spawn_unit(&mut commands, &mesh, &mat_for(Team::Blue, bk), Team::Blue, bk, Hex::new(bq, r));
         }
     }
 
@@ -129,15 +138,41 @@ fn spawn_unit(
     mesh: &Handle<Mesh>,
     material: &Handle<ColorMaterial>,
     team: Team,
+    kind: Kind,
     hex: Hex,
 ) {
     let p = hex_to_world(hex);
     commands.spawn((
-        unit(team, Kind::Infantry, hex, 1),
+        unit(team, kind, hex, 1),
         Mesh2d(mesh.clone()),
         MeshMaterial2d(material.clone()),
         Transform::from_xyz(p.x, p.y, 0.0).with_rotation(Quat::from_rotation_z(FLAT_TOP)),
     ));
+}
+
+/// Front line is cavalry, centre infantry, rear skirmishers — keyed off how
+/// far the column sits from the battlefield centre (q = 0).
+fn kind_for(abs_q: i32) -> Kind {
+    if abs_q <= 8 {
+        Kind::Cavalry
+    } else if abs_q >= 13 {
+        Kind::Skirmisher
+    } else {
+        Kind::Infantry
+    }
+}
+
+fn unit_color(team: Team, kind: Kind) -> Color {
+    let (r, g, b): (f32, f32, f32) = match team {
+        Team::Red => (0.92, 0.30, 0.30),
+        Team::Blue => (0.34, 0.52, 0.96),
+    };
+    let f: f32 = match kind {
+        Kind::Cavalry => 1.25,
+        Kind::Infantry => 1.0,
+        Kind::Skirmisher => 0.65,
+    };
+    Color::srgb((r * f).min(1.0), (g * f).min(1.0), (b * f).min(1.0))
 }
 
 /// Keyboard → orders for the Red army (group 1).
