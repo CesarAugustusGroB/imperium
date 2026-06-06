@@ -12,6 +12,8 @@ antes de comprometer el juego entero.
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
+- **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
+  el enemigo visible (greedy en el avance abierto).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
@@ -58,15 +60,14 @@ cargo run -p imperium       # abre la ventana con la batalla
 
 ## Pendiente
 
-- **Fase 2c — `hexx` + A\***: reemplazar el hex math a mano por `hexx` y rutar con
-  A* alrededor de obstáculos (hoy el paso es greedy + skip-impassable, puede
-  estancarse en concavidades). Ahora que hay terreno, A* gana.
+- **A\* a escala**: hoy se corre A* por unidad por tick (target dentro de VISION).
+  Para miles hay que throttlear/cachear el path o usar flow-fields.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
 - Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
 - Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
   cambio importa al empujar a miles).
-- BRP/MCP para manejar el juego desde agentes; Steamworks.
+- IA enemiga (behavior tree), BRP/MCP para manejar el juego desde agentes; Steamworks.
 
 ## Notas de diseño
 

@@ -4,15 +4,16 @@
 //! the tick is a chained pipeline of systems, proximity goes through a spatial
 //! index (not all-pairs), and the whole thing runs headless for tests.
 //!
-//! Fase 2a scope: terrain (passability, move cost, defensive bonus) on top of
-//! Fase 1's orders + cooldowns. Still hand-rolled hex math + greedy stepping;
-//! `hexx` + A* routing land in Fase 2c, the linked-list spatial index later.
+//! Fase 2c scope: terrain (passability, move cost, defensive bonus) + orders +
+//! cooldowns, with movement now routed via **hexx A\*** around obstacles. Hex
+//! math stays hand-rolled for the hot per-tick path; hexx is used where it
+//! earns its place (pathfinding). The linked-list spatial index is still later.
 
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
-// Hex (flat-top axial). Hand-rolled for now; `hexx` replaces this in Fase 2c.
+// Hex (flat-top axial). Hand-rolled math; hexx is used for A* (see movement).
 // ---------------------------------------------------------------------------
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -291,8 +292,11 @@ pub fn resolve_damage(
     }
 }
 
-/// Disengaged units step one hex toward the nearest enemy (or the enemy line),
-/// over passable terrain, gated by cooldown (slower through forest/hills).
+/// Disengaged units advance toward the enemy over passable terrain, gated by
+/// cooldown (slower through forest/hills). A visible enemy is approached via
+/// hexx A* (routes around mountains/water); otherwise a cheap greedy step
+/// heads for the enemy line. A* is short-range only (target within VISION) to
+/// stay cheap — at thousands of units it must be throttled/cached further.
 pub fn movement(
     tick: Res<Tick>,
     orders: Res<Orders>,
@@ -323,29 +327,66 @@ pub fn movement(
             continue;
         }
 
-        let target = nearest_enemy(&idx, from, *team).unwrap_or(enemy_line(*team));
+        let enemy = nearest_enemy(&idx, from, *team);
+        let goal = enemy.unwrap_or_else(|| enemy_line(*team));
 
-        // Greedy step: the closest free, passable neighbor to the target.
-        let mut best: Option<Hex> = None;
-        let mut best_d = i32::MAX;
-        for n in from.neighbors() {
-            if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
-                continue;
-            }
-            let d = n.distance(target);
-            if d < best_d {
-                best_d = d;
-                best = Some(n);
-            }
-        }
+        // Prefer the A*-routed next hex toward a visible enemy; fall back to a
+        // greedy step (toward the enemy line, or when the A* hex is taken).
+        let step = match enemy.and_then(|e| a_star_step(from, e, &terrain)) {
+            Some(s) if !idx.occupied(s) && !reserved.contains(&(s.q, s.r)) => Some(s),
+            _ => greedy_step(from, goal, &terrain, &idx, &reserved),
+        };
 
-        if let Some(n) = best {
-            if n.distance(target) < from.distance(target) {
-                reserved.insert((n.q, n.r));
-                *hex = n;
-                next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
-            }
+        if let Some(n) = step {
+            reserved.insert((n.q, n.r));
+            *hex = n;
+            next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
         }
+    }
+}
+
+/// First hex after `from` on the A* path to `to`, routing around impassable
+/// terrain. `None` if `to` is unreachable.
+fn a_star_step(from: Hex, to: Hex, terrain: &TerrainMap) -> Option<Hex> {
+    let start = hexx::Hex::new(from.q, from.r);
+    let end = hexx::Hex::new(to.q, to.r);
+    let path = hexx::algorithms::a_star(start, end, |_, b| {
+        let t = terrain.get(Hex::new(b.x, b.y));
+        if t.passable() {
+            Some(t.move_cost() as u32)
+        } else {
+            None
+        }
+    })?;
+    path.into_iter()
+        .map(|h| Hex::new(h.x, h.y))
+        .find(|h| *h != from)
+}
+
+/// Closest free, passable neighbor that reduces straight-line distance to the
+/// goal. Used when there is no visible enemy, or the A* hex is occupied.
+fn greedy_step(
+    from: Hex,
+    goal: Hex,
+    terrain: &TerrainMap,
+    idx: &SpatialIndex,
+    reserved: &HashSet<(i32, i32)>,
+) -> Option<Hex> {
+    let mut best: Option<Hex> = None;
+    let mut best_d = i32::MAX;
+    for n in from.neighbors() {
+        if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
+            continue;
+        }
+        let d = n.distance(goal);
+        if d < best_d {
+            best_d = d;
+            best = Some(n);
+        }
+    }
+    match best {
+        Some(n) if n.distance(goal) < from.distance(goal) => Some(n),
+        _ => None,
     }
 }
 
@@ -488,6 +529,30 @@ mod tests {
         assert!(
             !occupied.contains(&Hex::new(9, 0)) && !occupied.contains(&Hex::new(9, 1)),
             "unit must not step onto a mountain: {occupied:?}"
+        );
+    }
+
+    #[test]
+    fn a_star_routes_around_a_wall() {
+        // Blue at (0,0); enemy at (3,0). A mountain wall at (1,0) and (1,1)
+        // blocks the straight line, leaving a gap at (1,-1). The unit must step
+        // around the wall, never onto a mountain.
+        let mut w = fresh_world();
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            t.set(Hex::new(1, 0), Terrain::Mountain);
+            t.set(Hex::new(1, 1), Terrain::Mountain);
+        }
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(3, 0), 1));
+
+        step(&mut w);
+
+        let h = *w.get::<Hex>(blue).expect("blue alive");
+        assert_ne!(h, Hex::new(0, 0), "unit should have moved");
+        assert!(
+            h != Hex::new(1, 0) && h != Hex::new(1, 1),
+            "unit must route around the wall, not onto it: {h:?}"
         );
     }
 
