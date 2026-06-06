@@ -1,0 +1,11 @@
+[package]
+name = "sim_core"
+version = "0.1.0"
+edition = "2021"
+
+# Pure, headless battle simulation. Depends ONLY on bevy_ecs (the standalone
+# ECS) — no rendering, no windowing, no I/O — so the harness/tests can drive it
+# without the render stack. This mirrors the engine-agnostic `simulate_tick`
+# split from the TS hex-tactics codebase.
+[dependencies]
+bevy_ecs = { workspace = true }

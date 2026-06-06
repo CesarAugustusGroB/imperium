@@ -1,0 +1,13 @@
+[package]
+name = "imperium"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { workspace = true }
+sim_core = { path = "../sim_core" }
+
+# Uncomment for much faster iterative recompiles during dev (needs the dylib on
+# the path at runtime; remove for distributable builds):
+# [features]
+# default = ["bevy/dynamic_linking"]
