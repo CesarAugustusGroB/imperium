@@ -4,16 +4,15 @@
 //! the tick is a chained pipeline of systems, proximity goes through a spatial
 //! index (not all-pairs), and the whole thing runs headless for tests.
 //!
-//! Fase 1a scope: per-group orders (Idle/March/Charge/Hold), per-type movement
-//! cooldowns (absolute `next_move_tick`), charge damage bonus, hold damage
-//! reduction. Still hand-rolled hex math (hexx lands with A*/terrain in Fase 1c)
-//! and a HashMap spatial index (linked-list array version is later).
+//! Fase 2a scope: terrain (passability, move cost, defensive bonus) on top of
+//! Fase 1's orders + cooldowns. Still hand-rolled hex math + greedy stepping;
+//! `hexx` + A* routing land in Fase 2c, the linked-list spatial index later.
 
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
-// Hex (flat-top axial). Hand-rolled for now; `hexx` replaces this in Fase 1c.
+// Hex (flat-top axial). Hand-rolled for now; `hexx` replaces this in Fase 2c.
 // ---------------------------------------------------------------------------
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -37,6 +36,87 @@ impl Hex {
     pub fn distance(self, o: Hex) -> i32 {
         ((self.q - o.q).abs() + (self.q + self.r - o.q - o.r).abs() + (self.r - o.r).abs()) / 2
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terrain
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Terrain {
+    Plains,
+    Forest,
+    Hill,
+    Mountain,
+    Water,
+}
+
+impl Terrain {
+    pub fn passable(self) -> bool {
+        !matches!(self, Terrain::Mountain | Terrain::Water)
+    }
+    /// Cooldown multiplier for entering this terrain.
+    pub fn move_cost(self) -> u64 {
+        match self {
+            Terrain::Forest | Terrain::Hill => 2,
+            _ => 1,
+        }
+    }
+    /// Multiplier on damage *taken* while standing here (<1 = protective).
+    pub fn defense_mult(self) -> f32 {
+        match self {
+            Terrain::Forest => 0.7,
+            Terrain::Hill => 0.6,
+            _ => 1.0,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct TerrainMap {
+    pub tiles: HashMap<(i32, i32), Terrain>,
+}
+
+impl TerrainMap {
+    pub fn get(&self, h: Hex) -> Terrain {
+        self.tiles.get(&(h.q, h.r)).copied().unwrap_or(Terrain::Plains)
+    }
+    pub fn set(&mut self, h: Hex, t: Terrain) {
+        self.tiles.insert((h.q, h.r), t);
+    }
+}
+
+/// Deterministic terrain over an axial rectangle. Coarse 4×4 blobs so biomes
+/// clump instead of speckling. Pure hash noise — no dependencies, no RNG state.
+pub fn generate_terrain(seed: i32, q_range: i32, r_range: i32) -> TerrainMap {
+    let mut map = TerrainMap::default();
+    for q in -q_range..=q_range {
+        for r in -r_range..=r_range {
+            let v = hash01(q.div_euclid(4), r.div_euclid(4), seed);
+            let t = if v < 0.10 {
+                Terrain::Water
+            } else if v < 0.20 {
+                Terrain::Mountain
+            } else if v < 0.38 {
+                Terrain::Forest
+            } else if v < 0.52 {
+                Terrain::Hill
+            } else {
+                Terrain::Plains
+            };
+            map.tiles.insert((q, r), t);
+        }
+    }
+    map
+}
+
+fn hash01(a: i32, b: i32, seed: i32) -> f32 {
+    let mut h = (a.wrapping_mul(73856093) ^ b.wrapping_mul(19349663) ^ seed.wrapping_mul(83492791))
+        as u32;
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 16;
+    (h as f32) / (u32::MAX as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,17 +268,18 @@ pub fn combat(
     }
 }
 
-/// Apply accumulated damage (Hold units take less); despawn the dead. Runs
-/// before movement so movers never step over a corpse this tick.
+/// Apply accumulated damage; defenders on protective terrain and Hold orders
+/// take less. Despawn the dead before movement so movers skip corpses.
 pub fn resolve_damage(
     mut commands: Commands,
-    mut units: Query<(Entity, &mut Health, &Team, &Group)>,
+    mut units: Query<(Entity, &mut Health, &Team, &Group, &Hex)>,
     orders: Res<Orders>,
+    terrain: Res<TerrainMap>,
     dmg: Res<DamageBuffer>,
 ) {
-    for (e, mut hp, team, group) in &mut units {
+    for (e, mut hp, team, group, hex) in &mut units {
         if let Some(d) = dmg.0.get(&e) {
-            let mut incoming = *d;
+            let mut incoming = *d * terrain.get(*hex).defense_mult();
             if orders.get(*team, group.0) == Order::Hold {
                 incoming *= 1.0 - HOLD_REDUCTION;
             }
@@ -211,11 +292,12 @@ pub fn resolve_damage(
 }
 
 /// Disengaged units step one hex toward the nearest enemy (or the enemy line),
-/// gated by their movement cooldown. Hold/Idle stand still.
+/// over passable terrain, gated by cooldown (slower through forest/hills).
 pub fn movement(
     tick: Res<Tick>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
+    terrain: Res<TerrainMap>,
     mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
 ) {
     let now = tick.0;
@@ -243,11 +325,11 @@ pub fn movement(
 
         let target = nearest_enemy(&idx, from, *team).unwrap_or(enemy_line(*team));
 
-        // Greedy step: the free neighbor that gets closest to the target.
+        // Greedy step: the closest free, passable neighbor to the target.
         let mut best: Option<Hex> = None;
         let mut best_d = i32::MAX;
         for n in from.neighbors() {
-            if idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
+            if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
                 continue;
             }
             let d = n.distance(target);
@@ -261,7 +343,7 @@ pub fn movement(
             if n.distance(target) < from.distance(target) {
                 reserved.insert((n.q, n.r));
                 *hex = n;
-                next.0 = now + move_period(*kind, order);
+                next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
             }
         }
     }
@@ -326,6 +408,7 @@ mod tests {
         let mut w = World::new();
         w.insert_resource(Tick::default());
         w.insert_resource(Orders::default());
+        w.insert_resource(TerrainMap::default());
         w.insert_resource(SpatialIndex::default());
         w.insert_resource(DamageBuffer::default());
         w
@@ -370,7 +453,6 @@ mod tests {
 
     #[test]
     fn hold_reduces_incoming_damage() {
-        // Two identical 1v1s; the Hold defender should end with more HP.
         let dmg_taken = |order: Order| -> f32 {
             let mut w = fresh_world();
             w.resource_mut::<Orders>().set(Team::Red, 1, order);
@@ -382,6 +464,46 @@ mod tests {
         assert!(
             dmg_taken(Order::Hold) < dmg_taken(Order::March),
             "Hold should reduce incoming damage"
+        );
+    }
+
+    #[test]
+    fn units_do_not_step_onto_impassable_terrain() {
+        let mut w = fresh_world();
+        // Blue at (10,0) wants to march toward -q. Wall the two left-ward
+        // neighbors with mountains; it must not enter them.
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            t.set(Hex::new(9, 0), Terrain::Mountain);
+            t.set(Hex::new(9, 1), Terrain::Mountain);
+        }
+        w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1));
+
+        step(&mut w);
+
+        let occupied: Vec<Hex> = {
+            let mut q = w.query::<&Hex>();
+            q.iter(&w).copied().collect()
+        };
+        assert!(
+            !occupied.contains(&Hex::new(9, 0)) && !occupied.contains(&Hex::new(9, 1)),
+            "unit must not step onto a mountain: {occupied:?}"
+        );
+    }
+
+    #[test]
+    fn defensive_terrain_reduces_damage() {
+        let dmg_on = |terrain: Terrain| -> f32 {
+            let mut w = fresh_world();
+            w.resource_mut::<TerrainMap>().set(Hex::new(0, 0), terrain);
+            let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(red).expect("red alive").0
+        };
+        assert!(
+            dmg_on(Terrain::Hill) < dmg_on(Terrain::Plains),
+            "defending on a hill should reduce damage taken"
         );
     }
 

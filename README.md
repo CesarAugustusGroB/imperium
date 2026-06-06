@@ -4,17 +4,21 @@ Prototipo en Bevy del motor del juego fusionado. Valida el stack y el diseño EC
 de la batalla del [blueprint](../hex-tactics/.worktrees/feature-presentation/docs/rust-engine-research/00-ENGINE-BLUEPRINT.md)
 antes de comprometer el juego entero.
 
-## Qué hace (Fase 1)
+## Qué hace (Fase 2)
 
-- 280 unidades (140 rojas vs 140 azules) sobre un **grid hexagonal** avanzan, chocan
-  y un bando es aniquilado.
-- **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns de movimiento**
-  por tipo de unidad; charge pega más, hold reduce el daño recibido.
+- 280 unidades (140 rojas vs 140 azules) sobre un **mapa hexagonal con terreno**
+  (llanura / bosque / colina / montaña / agua) avanzan, lo rodean, chocan y un
+  bando es aniquilado.
+- **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
+  ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
+  Generación determinista por semilla (hash noise, sin deps).
+- **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
+  charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  5 tests).
+  7 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
-  renderiza unidades + grid; el render solo espeja `Hex → Transform`.
+  renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
 ## Estructura
 
@@ -52,14 +56,14 @@ cargo run -p imperium       # abre la ventana con la batalla
 > las siguientes son rápidas. Para iterar aún más rápido, descomentá la feature
 > `bevy/dynamic_linking` en `crates/imperium/Cargo.toml`.
 
-## Pendiente (Fase 1c+)
+## Pendiente
 
-- `hexx` (A*, field-of-movement, FOV) en vez del hex math a mano — **se adopta
-  cuando llegue terreno/obstáculos**, que es donde A* gana frente al paso greedy.
-- `bevy_ecs_tilemap` para el grid — **diferido a cuando haya terreno con texturas**.
-  Es una herramienta de tiles texturizados (necesita atlas); sin arte no aporta sobre
-  el grid de mallas actual. Entra junto con el terreno.
-- Órdenes restantes (retreat/unleash), tipos ranged (skirmishers) y terreno + mods.
+- **Fase 2c — `hexx` + A\***: reemplazar el hex math a mano por `hexx` y rutar con
+  A* alrededor de obstáculos (hoy el paso es greedy + skip-impassable, puede
+  estancarse en concavidades). Ahora que hay terreno, A* gana.
+- `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
+  atlas; el grid de mallas coloreadas alcanza por ahora).
+- Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
 - Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
   cambio importa al empujar a miles).
 - BRP/MCP para manejar el juego desde agentes; Steamworks.

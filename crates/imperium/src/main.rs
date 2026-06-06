@@ -7,20 +7,25 @@
 //! mirrors `Hex` → `Transform` each frame.
 
 use bevy::prelude::*;
-use sim_core::{unit, DamageBuffer, Hex, Kind, Order, Orders, SpatialIndex, Team, Tick};
+use sim_core::{
+    generate_terrain, unit, DamageBuffer, Hex, Kind, Order, Orders, SpatialIndex, Team, Terrain,
+    TerrainMap, Tick,
+};
 
 const HEX_SIZE: f32 = 12.0;
 const COLS: i32 = 10;
 const ROWS: i32 = 14;
 const GRID_Q: i32 = 18;
 const GRID_R: i32 = 11;
+const SEED: i32 = 7;
 /// Rotate a Bevy `RegularPolygon` (pointy-top by default) to flat-top.
 const FLAT_TOP: f32 = std::f32::consts::FRAC_PI_6;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(ClearColor(Color::srgb(0.06, 0.07, 0.09)))
+        .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
+        .insert_resource(generate_terrain(SEED, GRID_Q, GRID_R))
         // Battle sim runs on a fixed timestep, decoupled from render framerate.
         .insert_resource(Time::<Fixed>::from_hz(2.0))
         .insert_resource(Tick::default())
@@ -44,6 +49,16 @@ fn main() {
         .run();
 }
 
+fn terrain_color(t: Terrain) -> Color {
+    match t {
+        Terrain::Plains => Color::srgb(0.20, 0.28, 0.17),
+        Terrain::Forest => Color::srgb(0.11, 0.21, 0.12),
+        Terrain::Hill => Color::srgb(0.36, 0.29, 0.18),
+        Terrain::Mountain => Color::srgb(0.36, 0.36, 0.40),
+        Terrain::Water => Color::srgb(0.11, 0.21, 0.42),
+    }
+}
+
 /// Flat-top axial → world pixels.
 fn hex_to_world(h: Hex) -> Vec2 {
     let x = HEX_SIZE * 1.5 * h.q as f32;
@@ -55,19 +70,39 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut terrain: ResMut<TerrainMap>,
 ) {
     commands.spawn(Camera2d);
 
-    // Static hex grid backdrop. Flat-top tiles, slightly inset so the dark
-    // clear color shows through as grid lines.
+    // Carve the two deploy zones to Plains so units never spawn stuck.
+    for r in -(ROWS / 2)..=(ROWS / 2 - 1) {
+        for col in 0..COLS {
+            terrain.set(Hex::new(-15 + col, r), Terrain::Plains);
+            terrain.set(Hex::new(6 + col, r), Terrain::Plains);
+        }
+    }
+
+    // Static hex grid, flat-top tiles inset so the dark clear color reads as
+    // grid lines. Each tile colored by its terrain.
     let grid_mesh = meshes.add(RegularPolygon::new(HEX_SIZE * 0.92, 6));
-    let grid_mat = materials.add(Color::srgb(0.13, 0.15, 0.19));
+    let mats: Vec<(Terrain, Handle<ColorMaterial>)> = [
+        Terrain::Plains,
+        Terrain::Forest,
+        Terrain::Hill,
+        Terrain::Mountain,
+        Terrain::Water,
+    ]
+    .into_iter()
+    .map(|t| (t, materials.add(terrain_color(t))))
+    .collect();
+    let mat_for = |t: Terrain| mats.iter().find(|(k, _)| *k == t).unwrap().1.clone();
+
     for q in -GRID_Q..=GRID_Q {
         for r in -GRID_R..=GRID_R {
             let p = hex_to_world(Hex::new(q, r));
             commands.spawn((
                 Mesh2d(grid_mesh.clone()),
-                MeshMaterial2d(grid_mat.clone()),
+                MeshMaterial2d(mat_for(terrain.get(Hex::new(q, r)))),
                 Transform::from_xyz(p.x, p.y, -1.0).with_rotation(Quat::from_rotation_z(FLAT_TOP)),
             ));
         }
