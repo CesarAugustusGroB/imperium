@@ -1,12 +1,13 @@
-//! Imperium — Fase 0 spike.
+//! Imperium — Fase 1 spike.
 //!
 //! A Bevy 0.18 window that runs the pure `sim_core` battle on a fixed 2 Hz tick
-//! and renders each unit as a colored hexagon. Two blocks of infantry advance,
-//! clash, and one side is wiped — driven entirely by the ECS pipeline in
-//! `sim_core`, with the renderer just mirroring `Hex` → `Transform` each frame.
+//! and renders each unit as a colored hexagon. Two infantry blocks advance,
+//! clash, and one side is wiped. Press 1/2/3 to order the RED army to
+//! March / Charge / Hold. All logic lives in `sim_core`; the renderer just
+//! mirrors `Hex` → `Transform` each frame.
 
 use bevy::prelude::*;
-use sim_core::{unit, DamageBuffer, Hex, Kind, SpatialIndex, Team, Tick};
+use sim_core::{unit, DamageBuffer, Hex, Kind, Order, Orders, SpatialIndex, Team, Tick};
 
 const HEX_SIZE: f32 = 12.0;
 const COLS: i32 = 10;
@@ -18,6 +19,7 @@ fn main() {
         // Battle sim runs on a fixed timestep, decoupled from render framerate.
         .insert_resource(Time::<Fixed>::from_hz(2.0))
         .insert_resource(Tick::default())
+        .insert_resource(Orders::default())
         .insert_resource(SpatialIndex::default())
         .insert_resource(DamageBuffer::default())
         .add_systems(Startup, setup)
@@ -33,7 +35,7 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(Update, sync_transforms)
+        .add_systems(Update, (control, sync_transforms))
         .run();
 }
 
@@ -63,6 +65,8 @@ fn setup(
             spawn_unit(&mut commands, &mesh, &blue, Team::Blue, Hex::new(6 + col, r));
         }
     }
+
+    info!("controls: [1] Red March  [2] Red Charge  [3] Red Hold");
 }
 
 fn spawn_unit(
@@ -74,11 +78,27 @@ fn spawn_unit(
 ) {
     let p = hex_to_world(hex);
     commands.spawn((
-        unit(team, Kind::Infantry, hex),
+        unit(team, Kind::Infantry, hex, 1),
         Mesh2d(mesh.clone()),
         MeshMaterial2d(material.clone()),
         Transform::from_xyz(p.x, p.y, 0.0),
     ));
+}
+
+/// Keyboard → orders for the Red army (group 1).
+fn control(keys: Res<ButtonInput<KeyCode>>, mut orders: ResMut<Orders>) {
+    if keys.just_pressed(KeyCode::Digit1) {
+        orders.set(Team::Red, 1, Order::March);
+        info!("Red → March");
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        orders.set(Team::Red, 1, Order::Charge);
+        info!("Red → Charge");
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        orders.set(Team::Red, 1, Order::Hold);
+        info!("Red → Hold");
+    }
 }
 
 /// Mirror the sim's authoritative `Hex` onto the render `Transform` each frame.
@@ -90,7 +110,7 @@ fn sync_transforms(mut q: Query<(&Hex, &mut Transform)>) {
     }
 }
 
-fn log_status(tick: Res<Tick>, q: Query<&Team>) {
+fn log_status(tick: Res<Tick>, orders: Res<Orders>, q: Query<&Team>) {
     if tick.0 % 4 != 0 {
         return;
     }
@@ -101,5 +121,11 @@ fn log_status(tick: Res<Tick>, q: Query<&Team>) {
             Team::Blue => blue += 1,
         }
     }
-    info!("tick {:>4} | red {:>3} | blue {:>3}", tick.0, red, blue);
+    info!(
+        "tick {:>4} | red {:>3} ({:?}) | blue {:>3}",
+        tick.0,
+        red,
+        orders.get(Team::Red, 1),
+        blue
+    );
 }

@@ -4,15 +4,16 @@
 //! the tick is a chained pipeline of systems, proximity goes through a spatial
 //! index (not all-pairs), and the whole thing runs headless for tests.
 //!
-//! Cut-1 scope: hand-rolled axial hex math, one occupant per hex, every unit
-//! marches/fights once per tick. Cooldowns, orders, terrain, ranged and the
-//! linked-list spatial index are Fase 1.
+//! Fase 1a scope: per-group orders (Idle/March/Charge/Hold), per-type movement
+//! cooldowns (absolute `next_move_tick`), charge damage bonus, hold damage
+//! reduction. Still hand-rolled hex math (hexx lands with A*/terrain in Fase 1c)
+//! and a HashMap spatial index (linked-list array version is later).
 
 use bevy_ecs::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
-// Hex (flat-top axial). Hand-rolled for cut-1; `hexx` replaces this in Fase 1.
+// Hex (flat-top axial). Hand-rolled for now; `hexx` replaces this in Fase 1c.
 // ---------------------------------------------------------------------------
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -42,7 +43,7 @@ impl Hex {
 // Components
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Team {
     Red,
     Blue,
@@ -58,7 +59,26 @@ pub enum Kind {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Health(pub f32);
 
+/// Group this unit belongs to (1..=4), the unit of command for orders.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Group(pub u8);
+
+/// Absolute tick this unit may next move on. Never reset on battle start
+/// (the load-bearing invariant from hex-tactics).
+#[derive(Component, Clone, Copy, Default, Debug)]
+pub struct NextMove(pub u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Order {
+    Idle,
+    March,
+    Charge,
+    Hold,
+}
+
 pub const DAMAGE_PER_TICK: f32 = 14.0;
+pub const CHARGE_BONUS: f32 = 10.0;
+pub const HOLD_REDUCTION: f32 = 0.5;
 pub const VISION: i32 = 8;
 
 pub fn max_hp(kind: Kind) -> f32 {
@@ -69,10 +89,24 @@ pub fn max_hp(kind: Kind) -> f32 {
     }
 }
 
+/// Ticks between moves. Cavalry/skirmishers are quicker; charging halves it.
+fn move_period(kind: Kind, order: Order) -> u64 {
+    let base = match kind {
+        Kind::Infantry => 2,
+        Kind::Cavalry => 1,
+        Kind::Skirmisher => 1,
+    };
+    if order == Order::Charge {
+        (base / 2).max(1)
+    } else {
+        base
+    }
+}
+
 /// Component bundle for one unit. Shared by the headless tests and the Bevy
 /// game (which adds render components alongside it on the same entity).
-pub fn unit(team: Team, kind: Kind, hex: Hex) -> (Hex, Health, Team, Kind) {
-    (hex, Health(max_hp(kind)), team, kind)
+pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
+    (hex, Health(max_hp(kind)), team, kind, Group(group), NextMove(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +115,19 @@ pub fn unit(team: Team, kind: Kind, hex: Hex) -> (Hex, Health, Team, Kind) {
 
 #[derive(Resource, Default)]
 pub struct Tick(pub u64);
+
+/// Per-(team, group) orders. Missing entries default to March.
+#[derive(Resource, Default)]
+pub struct Orders(pub HashMap<(Team, u8), Order>);
+
+impl Orders {
+    pub fn get(&self, team: Team, group: u8) -> Order {
+        self.0.get(&(team, group)).copied().unwrap_or(Order::March)
+    }
+    pub fn set(&mut self, team: Team, group: u8, order: Order) {
+        self.0.insert((team, group), order);
+    }
+}
 
 /// One occupant per hex (rigid block). Rebuilt every tick. The cache-friendly
 /// linked-list array version (§13) lands when we actually push to thousands.
@@ -92,6 +139,9 @@ pub struct SpatialIndex {
 impl SpatialIndex {
     fn at(&self, h: Hex) -> Option<(Entity, Team)> {
         self.cells.get(&(h.q, h.r)).copied()
+    }
+    fn occupied(&self, h: Hex) -> bool {
+        self.cells.contains_key(&(h.q, h.r))
     }
 }
 
@@ -115,29 +165,44 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
     }
 }
 
-/// Each unit deals damage to every adjacent enemy.
-pub fn combat(units: Query<(&Hex, &Team)>, idx: Res<SpatialIndex>, mut dmg: ResMut<DamageBuffer>) {
-    for (hex, team) in &units {
+/// Each unit damages every adjacent enemy; charging attackers hit harder.
+pub fn combat(
+    units: Query<(&Hex, &Team, &Group)>,
+    orders: Res<Orders>,
+    idx: Res<SpatialIndex>,
+    mut dmg: ResMut<DamageBuffer>,
+) {
+    for (hex, team, group) in &units {
+        let bonus = if orders.get(*team, group.0) == Order::Charge {
+            CHARGE_BONUS
+        } else {
+            0.0
+        };
         for n in hex.neighbors() {
             if let Some((enemy, eteam)) = idx.at(n) {
                 if eteam != *team {
-                    *dmg.0.entry(enemy).or_insert(0.0) += DAMAGE_PER_TICK;
+                    *dmg.0.entry(enemy).or_insert(0.0) += DAMAGE_PER_TICK + bonus;
                 }
             }
         }
     }
 }
 
-/// Apply accumulated damage; despawn the dead. Runs before movement so movers
-/// never step over a corpse this tick.
+/// Apply accumulated damage (Hold units take less); despawn the dead. Runs
+/// before movement so movers never step over a corpse this tick.
 pub fn resolve_damage(
     mut commands: Commands,
-    mut units: Query<(Entity, &mut Health)>,
+    mut units: Query<(Entity, &mut Health, &Team, &Group)>,
+    orders: Res<Orders>,
     dmg: Res<DamageBuffer>,
 ) {
-    for (e, mut hp) in &mut units {
+    for (e, mut hp, team, group) in &mut units {
         if let Some(d) = dmg.0.get(&e) {
-            hp.0 -= *d;
+            let mut incoming = *d;
+            if orders.get(*team, group.0) == Order::Hold {
+                incoming *= 1.0 - HOLD_REDUCTION;
+            }
+            hp.0 -= incoming;
         }
         if hp.0 <= 0.0 {
             commands.entity(e).despawn();
@@ -145,14 +210,29 @@ pub fn resolve_damage(
     }
 }
 
-/// Disengaged units step one hex toward the nearest enemy (or the enemy line).
-pub fn movement(mut units: Query<(&mut Hex, &Team)>, idx: Res<SpatialIndex>) {
+/// Disengaged units step one hex toward the nearest enemy (or the enemy line),
+/// gated by their movement cooldown. Hold/Idle stand still.
+pub fn movement(
+    tick: Res<Tick>,
+    orders: Res<Orders>,
+    idx: Res<SpatialIndex>,
+    mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
+) {
+    let now = tick.0;
     let mut reserved: HashSet<(i32, i32)> = HashSet::new();
 
-    for (mut hex, team) in &mut units {
+    for (mut hex, team, kind, group, mut next) in &mut units {
+        let order = orders.get(*team, group.0);
+        if matches!(order, Order::Hold | Order::Idle) {
+            continue;
+        }
+        if now < next.0 {
+            continue; // still on cooldown
+        }
+
         let from = *hex;
 
-        // Adjacent to an enemy → fighting, hold position.
+        // Adjacent to an enemy → engaged, hold position (still fights via combat).
         let fighting = from
             .neighbors()
             .iter()
@@ -167,7 +247,7 @@ pub fn movement(mut units: Query<(&mut Hex, &Team)>, idx: Res<SpatialIndex>) {
         let mut best: Option<Hex> = None;
         let mut best_d = i32::MAX;
         for n in from.neighbors() {
-            if idx.cells.contains_key(&(n.q, n.r)) || reserved.contains(&(n.q, n.r)) {
+            if idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
                 continue;
             }
             let d = n.distance(target);
@@ -181,6 +261,7 @@ pub fn movement(mut units: Query<(&mut Hex, &Team)>, idx: Res<SpatialIndex>) {
             if n.distance(target) < from.distance(target) {
                 reserved.insert((n.q, n.r));
                 *hex = n;
+                next.0 = now + move_period(*kind, order);
             }
         }
     }
@@ -244,6 +325,7 @@ mod tests {
     fn fresh_world() -> World {
         let mut w = World::new();
         w.insert_resource(Tick::default());
+        w.insert_resource(Orders::default());
         w.insert_resource(SpatialIndex::default());
         w.insert_resource(DamageBuffer::default());
         w
@@ -252,8 +334,8 @@ mod tests {
     #[test]
     fn adjacent_enemies_deal_damage() {
         let mut w = fresh_world();
-        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0))).id();
-        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0)));
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
 
         step(&mut w);
 
@@ -264,8 +346,7 @@ mod tests {
     #[test]
     fn isolated_unit_marches_toward_the_enemy_line() {
         let mut w = fresh_world();
-        // A lone Blue unit on the right should march toward -q (the Red line).
-        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(10, 0))).id();
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
 
         step(&mut w);
 
@@ -274,11 +355,42 @@ mod tests {
     }
 
     #[test]
+    fn held_units_do_not_move() {
+        let mut w = fresh_world();
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Hold);
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        for _ in 0..10 {
+            step(&mut w);
+        }
+
+        let h = *w.get::<Hex>(blue).expect("blue alive");
+        assert_eq!(h, Hex::new(10, 0), "held unit must not move, at {h:?}");
+    }
+
+    #[test]
+    fn hold_reduces_incoming_damage() {
+        // Two identical 1v1s; the Hold defender should end with more HP.
+        let dmg_taken = |order: Order| -> f32 {
+            let mut w = fresh_world();
+            w.resource_mut::<Orders>().set(Team::Red, 1, order);
+            let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(red).expect("red alive").0
+        };
+        assert!(
+            dmg_taken(Order::Hold) < dmg_taken(Order::March),
+            "Hold should reduce incoming damage"
+        );
+    }
+
+    #[test]
     fn battle_resolves_to_a_decided_outcome() {
         let mut w = fresh_world();
         for r in 0..6 {
-            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, r)));
-            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, r)));
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, r), 1));
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, r), 1));
         }
 
         for _ in 0..500 {
