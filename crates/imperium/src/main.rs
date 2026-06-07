@@ -6,6 +6,7 @@
 //! March / Charge / Hold. All logic lives in `sim_core`; the renderer just
 //! mirrors `Hex` → `Transform` each frame.
 
+use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
@@ -14,10 +15,11 @@ use sim_core::{
 };
 
 const HEX_SIZE: f32 = 12.0;
-const COLS: i32 = 10;
-const ROWS: i32 = 14;
-const GRID_Q: i32 = 18;
-const GRID_R: i32 = 11;
+const ARMY_COLS: i32 = 28;
+const ARMY_ROWS: i32 = 54;
+const GAP: i32 = 12; // hexes between the two armies' inner edges
+const GRID_Q: i32 = 40;
+const GRID_R: i32 = 34;
 const SEED: i32 = 7;
 /// Rotate a Bevy `RegularPolygon` (pointy-top by default) to flat-top.
 const FLAT_TOP: f32 = std::f32::consts::FRAC_PI_6;
@@ -29,6 +31,11 @@ fn main() {
         // 15702). This is the runtime-agent hook — an agent can drive/inspect
         // the running battle. Register the sim components so they're queryable.
         .add_plugins((RemotePlugin::default(), RemoteHttpPlugin::default()))
+        // FPS + frame time logged to console every second (scale stress test).
+        .add_plugins((
+            FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
+        ))
         .register_type::<Hex>()
         .register_type::<Health>()
         .register_type::<Team>()
@@ -87,10 +94,11 @@ fn setup(
     commands.spawn(Camera2d);
 
     // Carve the two deploy zones to Plains so units never spawn stuck.
-    for r in -(ROWS / 2)..=(ROWS / 2 - 1) {
-        for col in 0..COLS {
-            terrain.set(Hex::new(-15 + col, r), Terrain::Plains);
-            terrain.set(Hex::new(6 + col, r), Terrain::Plains);
+    for col in 0..ARMY_COLS {
+        for row in 0..ARMY_ROWS {
+            let r = row - ARMY_ROWS / 2;
+            terrain.set(Hex::new(-(GAP / 2) - 1 - col, r), Terrain::Plains);
+            terrain.set(Hex::new((GAP / 2) + 1 + col, r), Terrain::Plains);
         }
     }
 
@@ -130,19 +138,21 @@ fn setup(
     }
     let mat_for = |team, kind| umat.iter().find(|(t, k, _)| *t == team && *k == kind).unwrap().2.clone();
 
-    // Red block on the left, Blue block on the right; a gap in the middle.
-    // Cavalry forms the front, infantry the centre, skirmishers the rear.
-    for col in 0..COLS {
-        for row in 0..ROWS {
-            let r = row - ROWS / 2;
-            let (rq, bq) = (-15 + col, 6 + col);
-            let (rk, bk) = (kind_for(rq.abs()), kind_for(bq.abs()));
-            spawn_unit(&mut commands, &mesh, &mat_for(Team::Red, rk), Team::Red, rk, Hex::new(rq, r));
-            spawn_unit(&mut commands, &mesh, &mat_for(Team::Blue, bk), Team::Blue, bk, Hex::new(bq, r));
+    // Red on the left, Blue on the right; a gap in the middle. Cavalry forms
+    // the front (inner columns), infantry the centre, skirmishers the rear.
+    let mut n = 0;
+    for col in 0..ARMY_COLS {
+        let kind = kind_for(col, ARMY_COLS);
+        for row in 0..ARMY_ROWS {
+            let r = row - ARMY_ROWS / 2;
+            let (rq, bq) = (-(GAP / 2) - 1 - col, (GAP / 2) + 1 + col);
+            spawn_unit(&mut commands, &mesh, &mat_for(Team::Red, kind), Team::Red, kind, Hex::new(rq, r));
+            spawn_unit(&mut commands, &mesh, &mat_for(Team::Blue, kind), Team::Blue, kind, Hex::new(bq, r));
+            n += 2;
         }
     }
 
-    info!("controls: [1] Red March  [2] Red Charge  [3] Red Hold");
+    info!("spawned {n} units | controls: [1] Red March  [2] Red Charge  [3] Red Hold");
 }
 
 fn spawn_unit(
@@ -162,12 +172,12 @@ fn spawn_unit(
     ));
 }
 
-/// Front line is cavalry, centre infantry, rear skirmishers — keyed off how
-/// far the column sits from the battlefield centre (q = 0).
-fn kind_for(abs_q: i32) -> Kind {
-    if abs_q <= 8 {
+/// Front line is cavalry, centre infantry, rear skirmishers — by how deep the
+/// column sits in the formation (col 0 = inner/front).
+fn kind_for(col: i32, cols: i32) -> Kind {
+    if col < cols / 4 {
         Kind::Cavalry
-    } else if abs_q >= 13 {
+    } else if col >= cols * 3 / 4 {
         Kind::Skirmisher
     } else {
         Kind::Infantry

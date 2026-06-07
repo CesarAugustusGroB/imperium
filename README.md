@@ -6,9 +6,10 @@ antes de comprometer el juego entero.
 
 ## Qué hace (Fase 3)
 
-- 280 unidades (140 rojas vs 140 azules) sobre un **mapa hexagonal con terreno**
-  (llanura / bosque / colina / montaña / agua) avanzan, lo rodean, chocan y un
-  bando es aniquilado.
+- **~3000 unidades** (1512 rojas vs 1512 azules) sobre un **mapa hexagonal con
+  terreno** (llanura / bosque / colina / montaña / agua) avanzan, lo rodean, chocan
+  y un bando es aniquilado. Corre a **~50-90 FPS en build *debug*** (release: mucho
+  más). Bajá `ARMY_COLS`/`ARMY_ROWS` en `main.rs` para un combate más chico/viewable.
 - **Tres tipos de unidad** con rol distinto: **infantry** (tanque, melee),
   **cavalry** (rápida, carga fuerte; al frente), **skirmisher** (dispara a distancia
   y *kitea* — se aleja del cuerpo a cuerpo; en retaguardia). Coloreadas por tipo.
