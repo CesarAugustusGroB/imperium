@@ -38,6 +38,7 @@ fn main() {
             (
                 sim_core::tick_and_clear,
                 sim_core::build_spatial_index,
+                sim_core::enemy_ai,
                 sim_core::combat,
                 sim_core::resolve_damage,
                 sim_core::movement,
@@ -212,10 +213,11 @@ fn log_status(tick: Res<Tick>, orders: Res<Orders>, q: Query<&Team>) {
         }
     }
     info!(
-        "tick {:>4} | red {:>3} ({:?}) | blue {:>3}",
+        "tick {:>4} | red {:>3} ({:?}) | blue {:>3} (AI {:?})",
         tick.0,
         red,
         orders.get(Team::Red, 1),
-        blue
+        blue,
+        orders.get(Team::Blue, 1),
     );
 }

@@ -12,6 +12,9 @@ antes de comprometer el juego entero.
 - **Tres tipos de unidad** con rol distinto: **infantry** (tanque, melee),
   **cavalry** (rápida, carga fuerte; al frente), **skirmisher** (dispara a distancia
   y *kitea* — se aleja del cuerpo a cuerpo; en retaguardia). Coloreadas por tipo.
+- **IA enemiga** (bando azul): setea sus órdenes según el balance de fuerzas —
+  avanza para cerrar, *hold* cuando está parejo o perdiendo, *charge* cuando va
+  ganando y hay contacto. Emula el estilo "amasar → lanzar / defender perdiendo".
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
@@ -21,7 +24,7 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  10 tests).
+  11 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 

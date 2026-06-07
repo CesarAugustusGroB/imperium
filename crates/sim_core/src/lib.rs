@@ -515,6 +515,49 @@ fn enemy_line(team: Team) -> Hex {
 }
 
 // ---------------------------------------------------------------------------
+// Enemy AI (Blue). The game opts into this system; the headless `step` pipeline
+// stays AI-free so tests drive orders directly.
+// ---------------------------------------------------------------------------
+
+/// Army-level order from the current force balance. Emulates the user's style:
+/// advance to close, hold when even or losing, commit (charge) when ahead and
+/// in contact.
+pub fn ai_order(own: u32, foe: u32, engaged: u32) -> Order {
+    if foe == 0 {
+        Order::March // nothing to fight → advance
+    } else if own * 5 < foe * 4 {
+        Order::Hold // outnumbered (< 0.8×) → defend
+    } else if engaged > 0 && own >= foe {
+        Order::Charge // in contact and not behind → launch
+    } else if engaged > 0 {
+        Order::Hold // in contact, roughly even → hold the line
+    } else {
+        Order::March // not yet in contact → advance and amass
+    }
+}
+
+/// Sets Blue's orders each tick from the battle state.
+pub fn enemy_ai(units: Query<(&Hex, &Team)>, idx: Res<SpatialIndex>, mut orders: ResMut<Orders>) {
+    let (mut own, mut foe, mut engaged) = (0u32, 0u32, 0u32);
+    for (hex, team) in &units {
+        match team {
+            Team::Blue => {
+                own += 1;
+                if hex
+                    .neighbors()
+                    .iter()
+                    .any(|n| matches!(idx.at(*n), Some((_, t)) if t == Team::Red))
+                {
+                    engaged += 1;
+                }
+            }
+            Team::Red => foe += 1,
+        }
+    }
+    orders.set(Team::Blue, 1, ai_order(own, foe, engaged));
+}
+
+// ---------------------------------------------------------------------------
 // Headless driver — used by tests and re-used by the game's tick.
 // ---------------------------------------------------------------------------
 
@@ -688,6 +731,15 @@ mod tests {
 
         let h = *w.get::<Hex>(sk).expect("skirmisher alive");
         assert!(h.distance(Hex::new(1, 0)) >= 2, "skirmisher should kite away, at {h:?}");
+    }
+
+    #[test]
+    fn ai_advances_then_commits_and_defends() {
+        assert_eq!(ai_order(10, 0, 0), Order::March, "no enemy → advance");
+        assert_eq!(ai_order(10, 10, 0), Order::March, "even, no contact → advance");
+        assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
+        assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
+        assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
     }
 
     #[test]
