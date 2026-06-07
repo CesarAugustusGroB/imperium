@@ -15,6 +15,8 @@ antes de comprometer el juego entero.
 - **IA enemiga** (bando azul): setea sus órdenes según el balance de fuerzas —
   avanza para cerrar, *hold* cuando está parejo o perdiendo, *charge* cuando va
   ganando y hay contacto. Emula el estilo "amasar → lanzar / defender perdiendo".
+- **BRP** (Bevy Remote Protocol): el ECS se expone por JSON-RPC en el puerto 15702;
+  un agente puede leer/mutar el juego corriendo (ver sección *Agentes*).
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
@@ -63,6 +65,24 @@ cargo run -p imperium       # abre la ventana con la batalla
 > La **primera** compilación de Bevy tarda varios minutos (compila todo el engine);
 > las siguientes son rápidas. Para iterar aún más rápido, descomentá la feature
 > `bevy/dynamic_linking` en `crates/imperium/Cargo.toml`.
+
+## Agentes en runtime (BRP)
+
+Con el juego corriendo, el **Bevy Remote Protocol** expone el ECS por JSON-RPC en
+`http://127.0.0.1:15702` — un agente puede **leer y manejar** la batalla en vivo.
+
+```powershell
+# leer todas las unidades vivas (Team + posición + HP)
+$body = '{"jsonrpc":"2.0","id":1,"method":"world.query","params":{"data":{"components":["sim_core::Team","sim_core::Hex","sim_core::Health"]}}}'
+Invoke-RestMethod -Uri http://127.0.0.1:15702 -Method Post -ContentType 'application/json' -Body $body
+# descubrir todos los métodos: world.query / world.mutate_components / world.spawn_entity / ...
+'{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}'
+```
+
+> ⚠️ **Gotcha de versión:** en Bevy 0.18 los métodos BRP son `world.*`
+> (`world.query`, `world.list_components`, …), **no** `bevy/*` como en 0.15–0.16.
+> Los componentes deben derivar `Reflect` + `#[reflect(Component)]` y registrarse
+> con `register_type` para ser consultables.
 
 ## Pendiente
 

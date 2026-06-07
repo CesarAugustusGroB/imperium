@@ -10,13 +10,15 @@
 //! earns its place (pathfinding). The linked-list spatial index is still later.
 
 use bevy_ecs::prelude::*;
+use bevy_reflect::Reflect;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Hex (flat-top axial). Hand-rolled math; hexx is used for A* (see movement).
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[reflect(Component)]
 pub struct Hex {
     pub q: i32,
     pub r: i32,
@@ -124,29 +126,34 @@ fn hash01(a: i32, b: i32, seed: i32) -> f32 {
 // Components
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[reflect(Component)]
 pub enum Team {
     Red,
     Blue,
 }
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug)]
+#[reflect(Component)]
 pub enum Kind {
     Infantry,
     Cavalry,
     Skirmisher,
 }
 
-#[derive(Component, Clone, Copy, Debug)]
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
 pub struct Health(pub f32);
 
 /// Group this unit belongs to (1..=4), the unit of command for orders.
-#[derive(Component, Clone, Copy, Debug)]
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
 pub struct Group(pub u8);
 
 /// Absolute tick this unit may next move on. Never reset on battle start
 /// (the load-bearing invariant from hex-tactics).
-#[derive(Component, Clone, Copy, Default, Debug)]
+#[derive(Component, Reflect, Clone, Copy, Default, Debug)]
+#[reflect(Component)]
 pub struct NextMove(pub u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

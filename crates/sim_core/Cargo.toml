@@ -8,5 +8,6 @@ edition = "2021"
 # without the render stack. This mirrors the engine-agnostic `simulate_tick`
 # split from the TS hex-tactics codebase.
 [dependencies]
-bevy_ecs = { workspace = true }
+bevy_ecs = { workspace = true, features = ["bevy_reflect"] }
+bevy_reflect = "0.18"
 hexx = "0.24"

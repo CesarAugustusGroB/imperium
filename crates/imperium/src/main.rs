@@ -7,9 +7,10 @@
 //! mirrors `Hex` → `Transform` each frame.
 
 use bevy::prelude::*;
+use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
-    generate_terrain, unit, DamageBuffer, Hex, Kind, Order, Orders, SpatialIndex, Team, Terrain,
-    TerrainMap, Tick,
+    generate_terrain, unit, DamageBuffer, Group, Health, Hex, Kind, NextMove, Order, Orders,
+    SpatialIndex, Team, Terrain, TerrainMap, Tick,
 };
 
 const HEX_SIZE: f32 = 12.0;
@@ -24,6 +25,16 @@ const FLAT_TOP: f32 = std::f32::consts::FRAC_PI_6;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        // Bevy Remote Protocol: query/mutate the live ECS over JSON-RPC (port
+        // 15702). This is the runtime-agent hook — an agent can drive/inspect
+        // the running battle. Register the sim components so they're queryable.
+        .add_plugins((RemotePlugin::default(), RemoteHttpPlugin::default()))
+        .register_type::<Hex>()
+        .register_type::<Health>()
+        .register_type::<Team>()
+        .register_type::<Kind>()
+        .register_type::<Group>()
+        .register_type::<NextMove>()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
         .insert_resource(generate_terrain(SEED, GRID_Q, GRID_R))
         // Battle sim runs on a fixed timestep, decoupled from render framerate.

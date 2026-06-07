@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { workspace = true }
+bevy = { workspace = true, features = ["bevy_remote"] }
 sim_core = { path = "../sim_core" }
 
 # Uncomment for much faster iterative recompiles during dev (needs the dylib on
