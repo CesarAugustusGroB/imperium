@@ -39,7 +39,9 @@ imperium/
 └── crates/
     ├── sim_core/             # batalla pura (bevy_ecs, sin render) + tests
     │   └── src/lib.rs
-    └── imperium/             # app Bevy (render, ventana, fixed tick)
+    ├── imperium/             # app Bevy (render, ventana, fixed tick, BRP)
+    │   └── src/main.rs
+    └── imperium-mcp/         # MCP server (stdio) → proxy al BRP del juego
         └── src/main.rs
 ```
 
@@ -84,6 +86,28 @@ Invoke-RestMethod -Uri http://127.0.0.1:15702 -Method Post -ContentType 'applica
 > (`world.query`, `world.list_components`, …), **no** `bevy/*` como en 0.15–0.16.
 > Los componentes deben derivar `Reflect` + `#[reflect(Component)]` y registrarse
 > con `register_type` para ser consultables.
+
+### MCP (manejar el juego como agente)
+
+`crates/imperium-mcp` es un **MCP server (stdio)** que envuelve el BRP con tools:
+
+- `battle_report` — conteo de unidades vivas por bando y por tipo.
+- `smite(team)` — mata una unidad del bando dado (efecto visible).
+
+Está registrado en `.mcp.json` (vía `cargo run -p imperium-mcp`). Para usarlo desde
+un cliente MCP (Claude Code, etc.): tené el **juego corriendo** (para que el BRP esté
+arriba), agregá el `.mcp.json` y **reiniciá la sesión** del cliente (los MCP servers
+se cargan al arranque). Verificación manual por stdio:
+
+```powershell
+# con el juego corriendo:
+$msgs = @(
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}',
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+ '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"battle_report","arguments":{}}}'
+)
+$msgs | & target\debug\imperium-mcp.exe
+```
 
 ## Pendiente
 

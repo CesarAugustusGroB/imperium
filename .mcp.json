@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "imperium": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--manifest-path",
+        "C:\\Users\\Henrich von Kleist\\workspace\\imperium\\Cargo.toml",
+        "-p",
+        "imperium-mcp"
+      ]
+    }
+  }
+}

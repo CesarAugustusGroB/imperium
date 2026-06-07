@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim_core", "crates/imperium"]
+members = ["crates/sim_core", "crates/imperium", "crates/imperium-mcp"]
 
 [workspace.dependencies]
 bevy = "0.18"
