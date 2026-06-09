@@ -14,8 +14,10 @@ antes de comprometer el juego entero.
   **cavalry** (rápida, carga fuerte; al frente), **skirmisher** (dispara a distancia
   y *kitea* — se aleja del cuerpo a cuerpo; en retaguardia). Coloreadas por tipo.
 - **IA enemiga** (bando azul): setea sus órdenes según el balance de fuerzas —
-  avanza para cerrar, *hold* cuando está parejo o perdiendo, *charge* cuando va
-  ganando y hay contacto. Emula el estilo "amasar → lanzar / defender perdiendo".
+  avanza para cerrar, *retreat* cuando la barren (< 0.5×), *hold* cuando va
+  perdiendo, *charge* cuando va ganando y hay contacto, y *unleash* (ataque total)
+  cuando domina (≥ 1.25×) y ya está en contacto. Emula el estilo "amasar → lanzar
+  / defender perdiendo".
 - **BRP** (Bevy Remote Protocol): el ECS se expone por JSON-RPC en el puerto 15702;
   un agente puede leer/mutar el juego corriendo (ver sección *Agentes*).
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
@@ -23,11 +25,15 @@ antes de comprometer el juego entero.
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
   el enemigo visible (greedy en el avance abierto).
-- **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
-  charge pega más, hold reduce daño.
-- Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
+- **Órdenes por grupo** (March / Charge / Hold / Idle / **Retreat** / **Unleash**)
+  y **cooldowns** por tipo: charge pega más y va más rápido, hold reduce daño,
+  **retreat** se repliega alejándose del enemigo hacia la línea propia, y
+  **unleash** es el ataque total (paso de carga, el mayor bonus de daño y los
+  skirmishers dejan de *kitear* para entrar al cuerpo a cuerpo).
+- Controles: **`1`** March · **`2`** Charge · **`3`** Hold · **`4`** Retreat ·
+  **`5`** Unleash (todos para Red, grupo 1).
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  15 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -115,7 +121,6 @@ $msgs | & target\debug\imperium-mcp.exe
   Para miles hay que throttlear/cachear el path o usar flow-fields.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
-- Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
 - Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
   cambio importa al empujar a miles).
 - IA enemiga (behavior tree), BRP/MCP para manejar el juego desde agentes; Steamworks.
