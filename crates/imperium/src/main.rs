@@ -211,6 +211,14 @@ fn control(keys: Res<ButtonInput<KeyCode>>, mut orders: ResMut<Orders>) {
         orders.set(Team::Red, 1, Order::Hold);
         info!("Red → Hold");
     }
+    if keys.just_pressed(KeyCode::Digit4) {
+        orders.set(Team::Red, 1, Order::Retreat);
+        info!("Red → Retreat");
+    }
+    if keys.just_pressed(KeyCode::Digit5) {
+        orders.set(Team::Red, 1, Order::Unleash);
+        info!("Red → Unleash");
+    }
 }
 
 /// Mirror the sim's authoritative `Hex` onto the render `Transform` each frame.

@@ -162,6 +162,22 @@ pub enum Order {
     March,
     Charge,
     Hold,
+    /// Fall back toward the group's own home line, peeling away from the
+    /// nearest enemy — flees even when engaged (a fighting withdrawal).
+    Retreat,
+    /// Full commitment: everyone presses the attack. Skirmishers stop kiting
+    /// and close to melee; a charge-style damage bonus and speed-up apply to
+    /// every kind (the "amasar → lanzar" release).
+    Unleash,
+}
+
+impl Order {
+    /// Orders that grant a melee bonus and a movement speed-up (the all-out
+    /// attacks). Skirmishers only join under `Unleash` (under `Charge` they
+    /// keep kiting, so they earn no melee bonus).
+    pub fn is_committed(self) -> bool {
+        matches!(self, Order::Charge | Order::Unleash)
+    }
 }
 
 pub const HOLD_REDUCTION: f32 = 0.5;
@@ -186,15 +202,23 @@ pub fn attack_damage(kind: Kind) -> f32 {
     }
 }
 
-/// Extra melee damage while charging (cavalry hits hardest; skirmishers never).
+/// Extra melee damage while committing to the attack (cavalry hits hardest).
+/// Skirmishers only earn it under `Unleash`, when they abandon kiting and pile
+/// in; under `Charge` they keep their distance and add nothing.
 pub fn charge_bonus(kind: Kind, order: Order) -> f32 {
-    if order != Order::Charge {
+    if !order.is_committed() {
         return 0.0;
     }
     match kind {
         Kind::Cavalry => 16.0,
         Kind::Infantry => 8.0,
-        Kind::Skirmisher => 0.0,
+        Kind::Skirmisher => {
+            if order == Order::Unleash {
+                6.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -213,7 +237,7 @@ fn move_period(kind: Kind, order: Order) -> u64 {
         Kind::Cavalry => 1,
         Kind::Skirmisher => 1,
     };
-    if order == Order::Charge {
+    if order.is_committed() {
         (base / 2).max(1)
     } else {
         base
@@ -357,8 +381,25 @@ pub fn movement(
         let from = *hex;
         let enemy = nearest_enemy(&idx, from, *team);
 
-        // Skirmishers kite: back off when an enemy gets close, shooting via combat.
-        if *kind == Kind::Skirmisher {
+        // Retreat: fall back toward home, peeling away from the nearest enemy.
+        // Unlike a normal march this overrides engagement — the group breaks
+        // contact instead of standing to fight.
+        if order == Order::Retreat {
+            let home = own_line(*team);
+            let step = enemy
+                .and_then(|e| kite_step(from, e, &terrain, &idx, &reserved))
+                .or_else(|| greedy_step(from, home, &terrain, &idx, &reserved));
+            if let Some(n) = step {
+                reserved.insert((n.q, n.r));
+                *hex = n;
+                next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
+            }
+            continue;
+        }
+
+        // Skirmishers kite: back off when an enemy gets close, shooting via
+        // combat. Under `Unleash` they abandon kiting and close to melee.
+        if *kind == Kind::Skirmisher && order != Order::Unleash {
             if let Some(e) = enemy {
                 if from.distance(e) <= KITE_THRESHOLD {
                     if let Some(n) = kite_step(from, e, &terrain, &idx, &reserved) {
@@ -519,6 +560,15 @@ fn enemy_line(team: Team) -> Hex {
         Team::Red => Hex::new(30, 0),
         Team::Blue => Hex::new(-30, 0),
     }
+}
+
+/// A group's own home line — the rally point a `Retreat` falls back toward
+/// (the mirror of `enemy_line`).
+fn own_line(team: Team) -> Hex {
+    enemy_line(match team {
+        Team::Red => Team::Blue,
+        Team::Blue => Team::Red,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +797,68 @@ mod tests {
         assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
         assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
         assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
+    }
+
+    #[test]
+    fn retreating_units_fall_back_toward_home() {
+        // Red's home line is toward -q; an enemy sits to the +q side. A
+        // retreating Red unit must put distance between itself and the enemy.
+        let mut w = fresh_world();
+        w.resource_mut::<Orders>().set(Team::Red, 1, Order::Retreat);
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, 0), 1));
+
+        step(&mut w);
+
+        let h = *w.get::<Hex>(red).expect("red alive");
+        assert!(
+            h.distance(Hex::new(2, 0)) > Hex::new(0, 0).distance(Hex::new(2, 0)),
+            "retreating unit should increase distance from the enemy, at {h:?}"
+        );
+    }
+
+    #[test]
+    fn retreating_units_break_contact_unlike_a_held_line() {
+        // Adjacent to an enemy, a marching unit stays to fight (engaged → hold
+        // position); a retreating unit instead peels away. Same setup, opposite
+        // movement — that is the whole point of the order.
+        let final_dist = |order: Order| -> i32 {
+            let mut w = fresh_world();
+            w.resource_mut::<Orders>().set(Team::Red, 1, order);
+            let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            w.get::<Hex>(red).map(|h| h.distance(Hex::new(1, 0))).unwrap_or(0)
+        };
+        assert_eq!(final_dist(Order::March), 1, "engaged marcher holds contact");
+        assert!(final_dist(Order::Retreat) > 1, "retreat must break contact");
+    }
+
+    #[test]
+    fn unleash_grants_a_melee_bonus_to_every_kind() {
+        // Charge already buffs melee; Unleash extends that buff to skirmishers,
+        // who otherwise never earn a charge bonus (they kite).
+        assert_eq!(charge_bonus(Kind::Skirmisher, Order::Charge), 0.0);
+        assert!(charge_bonus(Kind::Skirmisher, Order::Unleash) > 0.0);
+        assert!(charge_bonus(Kind::Cavalry, Order::Unleash) > 0.0);
+        assert!(charge_bonus(Kind::Infantry, Order::Unleash) > 0.0);
+    }
+
+    #[test]
+    fn unleashed_skirmishers_stop_kiting_and_close_in() {
+        // By default a cornered skirmisher backs away from an adjacent enemy.
+        // Under Unleash it commits instead, so it does not increase the gap.
+        let closes_in = |order: Order| -> bool {
+            let mut w = fresh_world();
+            w.resource_mut::<Orders>().set(Team::Red, 1, order);
+            let sk = w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            // True if it did NOT kite away (distance stayed at melee contact).
+            w.get::<Hex>(sk).map(|h| h.distance(Hex::new(1, 0)) <= 1).unwrap_or(false)
+        };
+        assert!(!closes_in(Order::March), "a kiting skirmisher backs off");
+        assert!(closes_in(Order::Unleash), "an unleashed skirmisher holds melee contact");
     }
 
     #[test]

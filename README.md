@@ -23,11 +23,14 @@ antes de comprometer el juego entero.
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
   el enemigo visible (greedy en el avance abierto).
-- **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
-  charge pega más, hold reduce daño.
-- Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
+- **Órdenes por grupo** (March / Charge / Hold / Idle / **Retreat** / **Unleash**)
+  y **cooldowns** por tipo; charge pega más, hold reduce daño, **retreat** rompe el
+  contacto y se repliega a la línea propia, **unleash** lanza a todos al cuerpo a
+  cuerpo (los skirmishers dejan de *kitear* y suman bonus de carga).
+- Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold ·
+  **`4`** Red Retreat · **`5`** Red Unleash.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  15 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -115,7 +118,7 @@ $msgs | & target\debug\imperium-mcp.exe
   Para miles hay que throttlear/cachear el path o usar flow-fields.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
-- Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
+- Grupos múltiples + UI de órdenes por grupo (hoy el teclado maneja solo Red/grupo 1).
 - Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
   cambio importa al empujar a miles).
 - IA enemiga (behavior tree), BRP/MCP para manejar el juego desde agentes; Steamworks.
