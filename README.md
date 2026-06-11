@@ -26,8 +26,15 @@ antes de comprometer el juego entero.
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
+- **Capa de animación (datos)**: cada unidad lleva un `AnimState`
+  (idle/move/attack/hit/die) que una máquina de estados recomputa por tick según
+  lo que la unidad *hizo* (prioridad attack > hit > move > idle). El sim emite
+  eventos discretos (`AttackEvent`, `DeathEvent`) en un log por tick
+  (`BattleEvents`) que la capa de render/audio consume, y un `AnimCatalog`
+  tipado mapea cada `(Kind, AnimState)` a frames de sprite-sheet — el arte real
+  queda para el humano; el esquema es el contrato. Sin render en `sim_core`.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  19 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -115,6 +122,9 @@ $msgs | & target\debug\imperium-mcp.exe
   Para miles hay que throttlear/cachear el path o usar flow-fields.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
+- **Render de animaciones**: la *capa de datos* ya está (`AnimState` + eventos +
+  `AnimCatalog`); falta que el crate `imperium` consuma el catálogo y dibuje los
+  sprite-sheets (hoy las paths del catálogo son placeholders, falta el arte).
 - Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
 - Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
   cambio importa al empujar a miles).
@@ -128,3 +138,12 @@ $msgs | & target\debug\imperium-mcp.exe
 - Determinismo: el `Schedule` corre los sistemas con `.chain()` (orden secuencial).
 - Las entidades comparten componentes de sim (`Hex`, `Health`, `Team`) y de render
   (`Mesh2d`, ...). Cuando el sim hace `despawn`, el sprite desaparece solo.
+- **Animación sin render**: `sim_core` no dibuja, pero produce todo lo que el
+  render necesita. El sistema `animate` corre **último** en el pipeline (después
+  de combate/daño/movimiento) y etiqueta cada sobreviviente con un `AnimState`.
+  La muerte no es un estado (la entidad ya fue `despawn`eada): se emite como
+  `DeathEvent` con team/kind/hex para que el render genere el efecto/cadáver.
+  Los eventos viven en `BattleEvents` (log limpiado cada tick, estilo
+  `DamageBuffer`) en vez de `Events<T>` de Bevy, para que el `step` headless siga
+  siendo un `Schedule` encadenado sin ciclo de doble buffer; el render puede
+  reenviarlos a un `EventWriter` si quiere.
