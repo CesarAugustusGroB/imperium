@@ -26,8 +26,12 @@ antes de comprometer el juego entero.
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
+- **Pathfinding cacheado**: cada unidad guarda su ruta A\* (`PathCache`) y la
+  **re-planea sólo cada `PATH_RECOMPUTE_PERIOD` ticks** (o cuando se agota / se
+  desvía / el objetivo se aleja), en vez de correr A\* por unidad *por tick* —
+  acota el costo del tick al escalar a miles.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  13 tests, incluido un stress headless de ~1500 unidades).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -111,8 +115,10 @@ $msgs | & target\debug\imperium-mcp.exe
 
 ## Pendiente
 
-- **A\* a escala**: hoy se corre A* por unidad por tick (target dentro de VISION).
-  Para miles hay que throttlear/cachear el path o usar flow-fields.
+- **A\* a escala**: ✅ el path ahora se **cachea y throttlea** (`PathCache`,
+  re-plan cada `PATH_RECOMPUTE_PERIOD` ticks). Falta el siguiente salto:
+  **flow-fields** para objetivos compartidos (un solo campo por bando en vez de
+  N rutas) cuando se empuje a decenas de miles.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
 - Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).

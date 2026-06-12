@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 // Hex (flat-top axial). Hand-rolled math; hexx is used for A* (see movement).
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[reflect(Component)]
 pub struct Hex {
     pub q: i32,
@@ -169,6 +169,33 @@ pub const VISION: i32 = 8;
 /// A skirmisher within this many hexes of an enemy backs off instead of meleeing.
 pub const KITE_THRESHOLD: i32 = 2;
 
+/// Ticks an A\* path stays cached before it is recomputed. The README's
+/// scalability item: rather than running A\* per unit *per tick*, each unit
+/// follows a cached route and only re-plans every few ticks (or when the route
+/// is exhausted / the goal drifts). Bounds the per-tick A\* count at scale.
+pub const PATH_RECOMPUTE_PERIOD: u64 = 5;
+/// If the goal (the nearest enemy) drifts more than this many hexes from the
+/// one the cached path was planned for, re-plan early.
+const PATH_GOAL_DRIFT: i32 = 2;
+
+/// Per-unit cached A\* route toward its current goal. Pure internal scratch
+/// state (not exposed over BRP), so it stays a plain `Component`. `steps` holds
+/// the upcoming hexes **reversed** (`last()` = the next step) for O(1) pops.
+#[derive(Component, Clone, Default, Debug)]
+pub struct PathCache {
+    steps: Vec<Hex>,
+    goal: Hex,
+    stale_at: u64,
+}
+
+impl Hex {
+    /// `true` once `steps.last()` is no longer one step from `from` — i.e. the
+    /// unit drifted off its cached route and the cache must be rebuilt.
+    fn off_route(self, next: Option<&Hex>) -> bool {
+        next.is_none_or(|n| self.distance(*n) != 1)
+    }
+}
+
 /// Hexes a unit can strike: melee = 1, skirmishers shoot at range.
 pub fn attack_range(kind: Kind) -> i32 {
     match kind {
@@ -223,7 +250,15 @@ fn move_period(kind: Kind, order: Order) -> u64 {
 /// Component bundle for one unit. Shared by the headless tests and the Bevy
 /// game (which adds render components alongside it on the same entity).
 pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
-    (hex, Health(max_hp(kind)), team, kind, Group(group), NextMove(0))
+    (
+        hex,
+        Health(max_hp(kind)),
+        team,
+        kind,
+        Group(group),
+        NextMove(0),
+        PathCache::default(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -340,12 +375,12 @@ pub fn movement(
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     terrain: Res<TerrainMap>,
-    mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
+    mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove, &mut PathCache)>,
 ) {
     let now = tick.0;
     let mut reserved: HashSet<(i32, i32)> = HashSet::new();
 
-    for (mut hex, team, kind, group, mut next) in &mut units {
+    for (mut hex, team, kind, group, mut next, mut cache) in &mut units {
         let order = orders.get(*team, group.0);
         if matches!(order, Order::Hold | Order::Idle) {
             continue;
@@ -383,8 +418,9 @@ pub fn movement(
         let goal = enemy.unwrap_or_else(|| enemy_line(*team));
 
         // Prefer the A*-routed next hex toward a visible enemy; fall back to a
-        // greedy step (toward the enemy line, or when the A* hex is taken).
-        let step = match enemy.and_then(|e| a_star_step(from, e, &terrain)) {
+        // greedy step (toward the enemy line, or when the A* hex is taken). The
+        // A* route is cached and re-planned only periodically (see PathCache).
+        let step = match enemy.and_then(|e| cached_step(from, e, &terrain, now, &mut cache)) {
             Some(s) if !idx.occupied(s) && !reserved.contains(&(s.q, s.r)) => Some(s),
             _ => greedy_step(from, goal, &terrain, &idx, &reserved),
         };
@@ -393,26 +429,55 @@ pub fn movement(
             reserved.insert((n.q, n.r));
             *hex = n;
             next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
+            // Consume the cached step if we walked onto it; otherwise the next
+            // tick sees an off-route cache and re-plans (self-healing).
+            if cache.steps.last() == Some(&n) {
+                cache.steps.pop();
+            }
         }
     }
 }
 
-/// First hex after `from` on the A* path to `to`, routing around impassable
-/// terrain. `None` if `to` is unreachable.
-fn a_star_step(from: Hex, to: Hex, terrain: &TerrainMap) -> Option<Hex> {
+/// Next hex toward `to` along a **cached** A* route, re-planning only when the
+/// cache is stale, exhausted, off-route, or the goal has drifted. Recomputing
+/// every `PATH_RECOMPUTE_PERIOD` ticks instead of every tick is what keeps the
+/// per-tick A* count bounded as unit counts climb into the thousands.
+fn cached_step(from: Hex, to: Hex, terrain: &TerrainMap, now: u64, cache: &mut PathCache) -> Option<Hex> {
+    let must_replan = now >= cache.stale_at
+        || cache.steps.is_empty()
+        || from.off_route(cache.steps.last())
+        || cache.goal.distance(to) > PATH_GOAL_DRIFT;
+    if must_replan {
+        cache.steps = a_star_path(from, to, terrain);
+        cache.goal = to;
+        cache.stale_at = now + PATH_RECOMPUTE_PERIOD;
+    }
+    cache.steps.last().copied()
+}
+
+/// The A* path from `from` to `to` (routing around impassable terrain),
+/// excluding `from` and **reversed** so the next step is `last()`. Empty if
+/// `to` is unreachable.
+fn a_star_path(from: Hex, to: Hex, terrain: &TerrainMap) -> Vec<Hex> {
     let start = hexx::Hex::new(from.q, from.r);
     let end = hexx::Hex::new(to.q, to.r);
-    let path = hexx::algorithms::a_star(start, end, |_, b| {
+    let Some(path) = hexx::algorithms::a_star(start, end, |_, b| {
         let t = terrain.get(Hex::new(b.x, b.y));
         if t.passable() {
             Some(t.move_cost() as u32)
         } else {
             None
         }
-    })?;
-    path.into_iter()
+    }) else {
+        return Vec::new();
+    };
+    let mut steps: Vec<Hex> = path
+        .into_iter()
         .map(|h| Hex::new(h.x, h.y))
-        .find(|h| *h != from)
+        .filter(|h| *h != from)
+        .collect();
+    steps.reverse();
+    steps
 }
 
 /// Closest free, passable neighbor that reduces straight-line distance to the
@@ -747,6 +812,83 @@ mod tests {
         assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
         assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
         assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
+    }
+
+    #[test]
+    fn cached_pathing_routes_around_a_wall_across_many_ticks() {
+        // A mountain wall blocks the straight line from (0,0) to a stationary
+        // enemy 8 hexes away. The mover threads the one-hex gap and closes in
+        // over several ticks — spanning multiple path-cache recomputes — and
+        // must never stand on a mountain, proving the cached route stays correct
+        // as it is consumed and re-planned. We stop the moment it reaches
+        // contact (before melee can resolve) so the assertion is about pathing.
+        let enemy = Hex::new(8, 0);
+        let mut w = fresh_world();
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            for r in -1..=2 {
+                t.set(Hex::new(2, r), Terrain::Mountain); // gap left at (2,-2)
+            }
+        }
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(0, 0), 1)).id();
+        // Stationary enemy (Hold) so the goal never drifts.
+        w.spawn(unit(Team::Red, Kind::Infantry, enemy, 1));
+        w.resource_mut::<Orders>().set(Team::Red, 1, Order::Hold);
+        let start_d = Hex::new(0, 0).distance(enemy);
+
+        let mut ticks = 0;
+        let mut reached = false;
+        for _ in 0..30 {
+            step(&mut w);
+            ticks += 1;
+            let h = *w.get::<Hex>(blue).expect("blue alive");
+            assert!(
+                w.resource::<TerrainMap>().get(h).passable(),
+                "mover stood on impassable terrain at {h:?}"
+            );
+            if h.distance(enemy) <= 1 {
+                reached = true;
+                break;
+            }
+        }
+
+        let end = *w.get::<Hex>(blue).expect("blue alive");
+        assert!(reached, "mover should have reached contact, ended at {end:?}");
+        assert!(
+            ticks as u64 > PATH_RECOMPUTE_PERIOD,
+            "approach should span multiple cache recomputes, took {ticks} ticks"
+        );
+        assert!(end.distance(enemy) < start_d, "mover should have closed in");
+    }
+
+    #[test]
+    fn stress_thousands_of_units_resolve_without_panic() {
+        // Headless scale smoke test: two large blocks collide and run for a
+        // good many ticks. Asserts the tick stays panic-free and the live unit
+        // count is monotonically non-increasing (units only ever die). This is
+        // the harness for the throttled-A* / spatial-index scalability work.
+        let mut w = fresh_world();
+        let per_side = 768;
+        let cols = 16;
+        for i in 0..per_side {
+            let (q, r) = (i % cols, i / cols);
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(-1 - q, r), 1));
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1 + q, r), 1));
+        }
+
+        let mut prev = count_units(&mut w);
+        assert_eq!(prev, per_side as usize * 2, "all units spawned");
+        for _ in 0..60 {
+            step(&mut w);
+            let now = count_units(&mut w);
+            assert!(now <= prev, "unit count must never grow: {now} > {prev}");
+            prev = now;
+        }
+        assert!(prev < per_side as usize * 2, "some units should have died");
+    }
+
+    fn count_units(w: &mut World) -> usize {
+        w.query::<&Team>().iter(w).count()
     }
 
     #[test]
