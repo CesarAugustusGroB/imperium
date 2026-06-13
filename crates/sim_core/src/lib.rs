@@ -530,6 +530,11 @@ fn enemy_line(team: Team) -> Hex {
 /// advance to close, hold when even or losing, commit (charge) when ahead and
 /// in contact.
 pub fn ai_order(own: u32, foe: u32, engaged: u32) -> Order {
+    // Widen to u64: `own * 5` overflows a u32 past ~858M units, and the project
+    // is explicitly aiming for tens of thousands → millions. Overflow is a
+    // debug-build panic (and silent wraparound in release), so the balance
+    // math must not lose precision at scale.
+    let (own, foe) = (u64::from(own), u64::from(foe));
     if foe == 0 {
         Order::March // nothing to fight → advance
     } else if own * 5 < foe * 4 {
@@ -771,5 +776,140 @@ mod tests {
             }
         }
         assert!(red == 0 || blue == 0, "one side should be wiped: red={red} blue={blue}");
+    }
+
+    // --- Robustness: determinism, invariants, and edge-case panic-safety ---
+
+    /// Order-independent snapshot of the live battle state. Two runs that agree
+    /// here agree on everything observable (team, position, exact HP bits).
+    fn snapshot(w: &mut World) -> Vec<(u8, i32, i32, u32)> {
+        let mut q = w.query::<(&Team, &Hex, &Health)>();
+        let mut v: Vec<(u8, i32, i32, u32)> = q
+            .iter(w)
+            .map(|(t, h, hp)| ((*t == Team::Blue) as u8, h.q, h.r, hp.0.to_bits()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn simulation_is_bit_for_bit_deterministic() {
+        // The whole testable-engine premise rests on this: identical inputs must
+        // produce an identical trajectory, tick for tick, on every run.
+        let build = || {
+            let mut w = fresh_world();
+            for r in 0..6 {
+                w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, r), 1));
+                w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(3, r), 1));
+                w.spawn(unit(Team::Blue, Kind::Skirmisher, Hex::new(5, r), 1));
+            }
+            w
+        };
+        let mut a = build();
+        let mut b = build();
+        for t in 0..200 {
+            step(&mut a);
+            step(&mut b);
+            assert_eq!(
+                snapshot(&mut a),
+                snapshot(&mut b),
+                "diverged at tick {t}: identical inputs must stay identical"
+            );
+        }
+    }
+
+    #[test]
+    fn battle_preserves_core_invariants_every_tick() {
+        let mut w = fresh_world();
+        // A mountain ridge at q=0 the armies must route around, never onto.
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            for r in -3..=3 {
+                t.set(Hex::new(0, r), Terrain::Mountain);
+            }
+        }
+        for r in -4..=4 {
+            w.spawn(unit(Team::Red, Kind::Cavalry, Hex::new(-3, r), 1));
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(3, r), 1));
+        }
+
+        let mut prev = usize::MAX;
+        for tick in 0..150 {
+            step(&mut w);
+
+            let snap: Vec<(Hex, f32, Kind)> = {
+                let mut q = w.query::<(&Hex, &Health, &Kind)>();
+                q.iter(&w).map(|(h, hp, k)| (*h, hp.0, *k)).collect()
+            };
+            let terrain = w.resource::<TerrainMap>();
+            let mut seen: HashSet<(i32, i32)> = HashSet::new();
+            for (h, hp, k) in &snap {
+                // Health stays finite, positive (the dead are despawned), and is
+                // never healed above the unit's cap.
+                assert!(
+                    hp.is_finite() && *hp > 0.0 && *hp <= max_hp(*k),
+                    "tick {tick}: HP out of range: {hp} for {k:?}"
+                );
+                // Units never stand on impassable terrain.
+                assert!(
+                    terrain.get(*h).passable(),
+                    "tick {tick}: unit on impassable terrain at {h:?}"
+                );
+                // The rigid-block invariant: at most one unit per hex.
+                assert!(
+                    seen.insert((h.q, h.r)),
+                    "tick {tick}: two units share hex {h:?}"
+                );
+            }
+            // No unit is ever spawned mid-battle; the count only falls.
+            assert!(snap.len() <= prev, "tick {tick}: unit count grew to {}", snap.len());
+            prev = snap.len();
+        }
+    }
+
+    #[test]
+    fn empty_world_steps_without_panic() {
+        // A degenerate world (no units, no terrain) must tick cleanly.
+        let mut w = fresh_world();
+        for _ in 0..10 {
+            step(&mut w);
+        }
+        assert_eq!(w.resource::<Tick>().0, 10);
+    }
+
+    #[test]
+    fn a_fully_walled_unit_stays_put_without_panic() {
+        let mut w = fresh_world();
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            for n in Hex::new(0, 0).neighbors() {
+                t.set(n, Terrain::Mountain);
+            }
+        }
+        let u = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(0, 0), 1)).id();
+
+        for _ in 0..10 {
+            step(&mut w);
+        }
+
+        let h = *w.get::<Hex>(u).expect("unit alive");
+        assert_eq!(h, Hex::new(0, 0), "a boxed-in unit has no legal move, at {h:?}");
+    }
+
+    #[test]
+    fn ai_order_balance_math_survives_scale() {
+        // `own * 5` overflows a u32 past ~858M units — a debug-build panic.
+        // The balance thresholds must still hold at hundreds of millions.
+        assert_eq!(ai_order(1_000_000_000, 0, 0), Order::March, "no enemy → advance");
+        assert_eq!(
+            ai_order(1_000_000_000, 1_000_000_000, 5),
+            Order::Charge,
+            "even and engaged at scale → launch"
+        );
+        assert_eq!(
+            ai_order(500_000_000, 1_000_000_000, 5),
+            Order::Hold,
+            "outnumbered at scale → defend"
+        );
     }
 }

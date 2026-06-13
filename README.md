@@ -27,7 +27,7 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  16 tests — incluyendo determinismo bit-a-bit e invariantes de batalla).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -126,5 +126,9 @@ $msgs | & target\debug\imperium-mcp.exe
   `battle_resolves_to_a_decided_outcome` construye un `World`, corre 500 ticks y
   assertea — el equivalente Rust del harness `sim-formations.ts`.
 - Determinismo: el `Schedule` corre los sistemas con `.chain()` (orden secuencial).
+  Garantizado por el test `simulation_is_bit_for_bit_deterministic` (dos `World`
+  idénticos divergen ⟹ falla). Invariantes de batalla (un ocupante por hex, HP
+  finito y nunca curado, nadie sobre terreno intransitable, conteo monótono) se
+  chequean tick a tick en `battle_preserves_core_invariants_every_tick`.
 - Las entidades comparten componentes de sim (`Hex`, `Health`, `Team`) y de render
   (`Mesh2d`, ...). Cuando el sim hace `despawn`, el sprite desaparece solo.
