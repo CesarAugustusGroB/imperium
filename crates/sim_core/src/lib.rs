@@ -246,19 +246,75 @@ impl Orders {
     }
 }
 
-/// One occupant per hex (rigid block). Rebuilt every tick. The cache-friendly
-/// linked-list array version (§13) lands when we actually push to thousands.
+/// One occupant per hex (rigid block), stored in a **dense array** over the
+/// bounding box of all occupied hexes — contiguous memory, hash-free O(1)
+/// lookups, rebuilt every tick. Replaces the per-hex `HashMap` placeholder
+/// (§13): at thousands of units the array's cache locality and the absence of
+/// per-probe hashing dominate the (linear) rebuild cost.
+///
+/// The grid spans exactly the occupied bounding box, so it stays compact for an
+/// army clustered on a battlefield. (A unit that strays far from the pack would
+/// inflate the box; the realistic, converging armies this engine simulates do
+/// not.) Lookups outside the box always miss.
 #[derive(Resource, Default)]
 pub struct SpatialIndex {
-    pub cells: HashMap<(i32, i32), (Entity, Team)>,
+    q_min: i32,
+    r_min: i32,
+    width: i32,
+    height: i32,
+    cells: Vec<Option<(Entity, Team)>>,
 }
 
 impl SpatialIndex {
-    fn at(&self, h: Hex) -> Option<(Entity, Team)> {
-        self.cells.get(&(h.q, h.r)).copied()
+    /// Linear cell index for `h`, or `None` if it lies outside the current
+    /// bounding box (and therefore cannot be occupied).
+    fn index(&self, h: Hex) -> Option<usize> {
+        let x = h.q - self.q_min;
+        let y = h.r - self.r_min;
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return None;
+        }
+        Some((y * self.width + x) as usize)
     }
+
+    fn at(&self, h: Hex) -> Option<(Entity, Team)> {
+        self.index(h).and_then(|i| self.cells[i])
+    }
+
     fn occupied(&self, h: Hex) -> bool {
-        self.cells.contains_key(&(h.q, h.r))
+        self.at(h).is_some()
+    }
+
+    /// Resize the dense grid to `bounds` (`(q_min, r_min, q_max, r_max)`) and
+    /// clear it. `None` (an empty world) yields an empty grid that misses every
+    /// lookup. Reuses the existing allocation across ticks.
+    fn reset(&mut self, bounds: Option<(i32, i32, i32, i32)>) {
+        match bounds {
+            None => {
+                self.q_min = 0;
+                self.r_min = 0;
+                self.width = 0;
+                self.height = 0;
+                self.cells.clear();
+            }
+            Some((q_min, r_min, q_max, r_max)) => {
+                self.q_min = q_min;
+                self.r_min = r_min;
+                self.width = q_max - q_min + 1;
+                self.height = r_max - r_min + 1;
+                let len = (self.width as usize) * (self.height as usize);
+                self.cells.clear();
+                self.cells.resize(len, None);
+            }
+        }
+    }
+
+    /// Mark `h` occupied. Last write wins (matching the old `HashMap` insert);
+    /// out-of-bounds writes are impossible since `reset` sized the box to fit.
+    fn set(&mut self, h: Hex, e: Entity, t: Team) {
+        if let Some(i) = self.index(h) {
+            self.cells[i] = Some((e, t));
+        }
     }
 }
 
@@ -276,9 +332,19 @@ pub fn tick_and_clear(mut tick: ResMut<Tick>, mut dmg: ResMut<DamageBuffer>) {
 }
 
 pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<SpatialIndex>) {
-    idx.cells.clear();
+    // Pass 1: bounding box of every occupied hex (so the grid stays compact).
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    for (_, h, _) in &units {
+        bounds = Some(match bounds {
+            None => (h.q, h.r, h.q, h.r),
+            Some((qn, rn, qx, rx)) => (qn.min(h.q), rn.min(h.r), qx.max(h.q), rx.max(h.r)),
+        });
+    }
+
+    // Pass 2: size the dense grid to that box and fill it.
+    idx.reset(bounds);
     for (e, h, t) in &units {
-        idx.cells.insert((h.q, h.r), (e, *t));
+        idx.set(*h, e, *t);
     }
 }
 
@@ -747,6 +813,61 @@ mod tests {
         assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
         assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
         assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
+    }
+
+    /// Build only the spatial index on the current world (no movement/combat),
+    /// so the dense grid can be inspected directly.
+    fn build_index(w: &mut World) {
+        let mut sched = Schedule::default();
+        sched.add_systems(build_spatial_index);
+        sched.run(w);
+    }
+
+    #[test]
+    fn dense_index_locates_units_and_misses_elsewhere() {
+        let mut w = fresh_world();
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(2, -3), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(-1, 4), 1));
+
+        build_index(&mut w);
+
+        let idx = w.resource::<SpatialIndex>();
+        assert_eq!(idx.at(Hex::new(2, -3)).map(|(e, _)| e), Some(red), "red must be indexed");
+        assert_eq!(idx.at(Hex::new(-1, 4)).map(|(_, t)| t), Some(Team::Blue), "blue must be indexed");
+        assert!(!idx.occupied(Hex::new(0, 0)), "an empty interior cell must miss");
+        assert!(idx.at(Hex::new(100, 100)).is_none(), "an out-of-bounds cell must miss");
+    }
+
+    #[test]
+    fn dense_index_handles_an_empty_world() {
+        let mut w = fresh_world();
+        build_index(&mut w);
+        let idx = w.resource::<SpatialIndex>();
+        assert!(!idx.occupied(Hex::new(0, 0)), "empty world: every lookup misses");
+        assert!(idx.at(Hex::new(5, 5)).is_none());
+    }
+
+    #[test]
+    fn dense_index_finds_every_unit_at_scale() {
+        // Stress/smoke: a 60×60 block (3600 units) on distinct hexes. Every one
+        // must be locatable, exercising the dense grid's bounding-box sizing and
+        // O(1) indexing at scale without a HashMap.
+        let mut w = fresh_world();
+        let mut placed = Vec::new();
+        for q in 0..60 {
+            for r in 0..60 {
+                let h = Hex::new(q, r);
+                let e = w.spawn(unit(Team::Red, Kind::Infantry, h, 1)).id();
+                placed.push((e, h));
+            }
+        }
+
+        build_index(&mut w);
+
+        let idx = w.resource::<SpatialIndex>();
+        for (e, h) in placed {
+            assert_eq!(idx.at(h).map(|(x, _)| x), Some(e), "unit at {h:?} must be indexed");
+        }
     }
 
     #[test]

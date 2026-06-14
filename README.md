@@ -27,7 +27,7 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  14 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -116,8 +116,10 @@ $msgs | & target\debug\imperium-mcp.exe
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
 - Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
-- Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
-  cambio importa al empujar a miles).
+- ~~Spatial index linked-list sobre arrays~~ **hecho**: el índice espacial es ahora
+  un **array denso** sobre el bounding box de las unidades (memoria contigua, lookups
+  O(1) sin hashing), reconstruido por tick — reemplaza el `HashMap` placeholder. Para
+  ejércitos dispersos un linked-list por celda sería el siguiente refinamiento.
 - IA enemiga (behavior tree), BRP/MCP para manejar el juego desde agentes; Steamworks.
 
 ## Notas de diseño
