@@ -22,12 +22,15 @@ antes de comprometer el juego entero.
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
-  el enemigo visible (greedy en el avance abierto).
+  el enemigo visible (greedy en el avance abierto). Si una unidad queda **trabada**
+  por sus propias filas (el hex que la acerca al objetivo está ocupado), hace un
+  *sidestep* lateral —a un hex libre que mantiene la distancia— y la columna fluye
+  alrededor del atasco en vez de quedarse clavada (anti-gridlock).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  13 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
