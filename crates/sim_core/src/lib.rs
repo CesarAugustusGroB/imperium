@@ -266,6 +266,21 @@ impl SpatialIndex {
 #[derive(Resource, Default)]
 pub struct DamageBuffer(pub HashMap<Entity, f32>);
 
+/// Shared-goal navigation field. For each team, a Dijkstra **integration field**
+/// over the terrain: `dist[(q, r)]` is the cheapest move-cost to reach that
+/// team's `enemy_line` from `(q, r)`, routing around impassable terrain. A unit
+/// with no enemy in sight follows the descending gradient instead of a private
+/// greedy step — so it flows around concave obstacles a greedy step dead-ends
+/// in, and the whole army shares **one** computed field (no per-unit A\*).
+///
+/// The field depends only on the (static) terrain and the fixed goal, so it is
+/// built once and reused for the rest of the battle.
+#[derive(Resource, Default)]
+pub struct FlowField {
+    dist: HashMap<Team, HashMap<(i32, i32), u32>>,
+    built: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Systems — pipeline order mirrors simulateTick's phases.
 // ---------------------------------------------------------------------------
@@ -280,6 +295,57 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
     for (e, h, t) in &units {
         idx.cells.insert((h.q, h.r), (e, *t));
     }
+}
+
+/// Build each team's flow field once, lazily, from the static terrain. Cheap
+/// no-op on every later tick (and while terrain is still empty). Runs before
+/// movement; only reads terrain, so it never races the per-tick state.
+pub fn build_flow_fields(terrain: Res<TerrainMap>, mut field: ResMut<FlowField>) {
+    if field.built || terrain.tiles.is_empty() {
+        return;
+    }
+    field.built = true;
+    for team in [Team::Red, Team::Blue] {
+        field.dist.insert(team, integrate(&terrain, enemy_line(team)));
+    }
+}
+
+/// Dijkstra from `goal` outward over passable terrain, yielding cost-to-goal per
+/// cell. Expansion is bounded to cells present in the terrain map (the
+/// battlefield), so the field stays finite even though the hex plane is not.
+/// Entering a cell costs that cell's `move_cost`, mirroring the A\* cost model.
+fn integrate(terrain: &TerrainMap, goal: Hex) -> HashMap<(i32, i32), u32> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut dist: HashMap<(i32, i32), u32> = HashMap::new();
+    if !terrain.get(goal).passable() {
+        return dist; // goal itself is in a wall → unreachable, empty field
+    }
+    dist.insert((goal.q, goal.r), 0);
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((0u32, goal.q, goal.r)));
+    while let Some(Reverse((d, q, r))) = heap.pop() {
+        if d > *dist.get(&(q, r)).unwrap_or(&u32::MAX) {
+            continue; // stale heap entry
+        }
+        for n in Hex::new(q, r).neighbors() {
+            // Only flow into cells the map actually covers (bounds the field).
+            if !terrain.tiles.contains_key(&(n.q, n.r)) {
+                continue;
+            }
+            let t = terrain.get(n);
+            if !t.passable() {
+                continue;
+            }
+            let nd = d + t.move_cost() as u32;
+            if nd < *dist.get(&(n.q, n.r)).unwrap_or(&u32::MAX) {
+                dist.insert((n.q, n.r), nd);
+                heap.push(Reverse((nd, n.q, n.r)));
+            }
+        }
+    }
+    dist
 }
 
 /// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
@@ -340,6 +406,7 @@ pub fn movement(
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     terrain: Res<TerrainMap>,
+    field: Res<FlowField>,
     mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
 ) {
     let now = tick.0;
@@ -380,13 +447,19 @@ pub fn movement(
             continue;
         }
 
-        let goal = enemy.unwrap_or_else(|| enemy_line(*team));
-
-        // Prefer the A*-routed next hex toward a visible enemy; fall back to a
-        // greedy step (toward the enemy line, or when the A* hex is taken).
-        let step = match enemy.and_then(|e| a_star_step(from, e, &terrain)) {
-            Some(s) if !idx.occupied(s) && !reserved.contains(&(s.q, s.r)) => Some(s),
-            _ => greedy_step(from, goal, &terrain, &idx, &reserved),
+        // With an enemy in sight, route to it: A*-routed hex, else a greedy step
+        // toward it. With no enemy in sight, the goal is the shared enemy line —
+        // follow the flow field (routes around concave terrain a greedy step
+        // dead-ends in), falling back to greedy when off-field or on open ground.
+        let step = if let Some(e) = enemy {
+            match a_star_step(from, e, &terrain) {
+                Some(s) if !idx.occupied(s) && !reserved.contains(&(s.q, s.r)) => Some(s),
+                _ => greedy_step(from, e, &terrain, &idx, &reserved),
+            }
+        } else {
+            let line = enemy_line(*team);
+            flow_step(&field, *team, from, &terrain, &idx, &reserved)
+                .or_else(|| greedy_step(from, line, &terrain, &idx, &reserved))
         };
 
         if let Some(n) = step {
@@ -439,6 +512,42 @@ fn greedy_step(
     match best {
         Some(n) if n.distance(goal) < from.distance(goal) => Some(n),
         _ => None,
+    }
+}
+
+/// Next hex down the flow field's gradient toward the team's enemy line: the
+/// free, passable neighbor with the lowest cost-to-goal. A unit already on the
+/// field only steps to a *strictly* closer cell (no oscillation on a plateau);
+/// a unit not yet on the field steps onto the nearest field cell to join it.
+/// `None` when there is no field for the team or no usable neighbor — the caller
+/// then falls back to the greedy step.
+fn flow_step(
+    field: &FlowField,
+    team: Team,
+    from: Hex,
+    terrain: &TerrainMap,
+    idx: &SpatialIndex,
+    reserved: &HashSet<(i32, i32)>,
+) -> Option<Hex> {
+    let dist = field.dist.get(&team)?;
+    let mut best: Option<Hex> = None;
+    let mut best_nd = u32::MAX;
+    for n in from.neighbors() {
+        if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
+            continue;
+        }
+        if let Some(&nd) = dist.get(&(n.q, n.r)) {
+            if nd < best_nd {
+                best_nd = nd;
+                best = Some(n);
+            }
+        }
+    }
+    let best = best?;
+    match dist.get(&(from.q, from.r)) {
+        Some(&here) if best_nd < here => Some(best), // descend the gradient
+        Some(_) => None,                             // plateau/uphill → let greedy decide
+        None => Some(best),                          // off-field → step on to join it
     }
 }
 
@@ -575,6 +684,7 @@ pub fn step(world: &mut World) {
         (
             tick_and_clear,
             build_spatial_index,
+            build_flow_fields,
             combat,
             resolve_damage,
             movement,
@@ -595,6 +705,7 @@ mod tests {
         w.insert_resource(TerrainMap::default());
         w.insert_resource(SpatialIndex::default());
         w.insert_resource(DamageBuffer::default());
+        w.insert_resource(FlowField::default());
         w
     }
 
@@ -747,6 +858,83 @@ mod tests {
         assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
         assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
         assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
+    }
+
+    /// Fill an axial rectangle with Plains, then wall `q = wall_q` with Mountain
+    /// for every row except `gap_r` — a one-hex pass through an otherwise solid
+    /// barrier. The far side is only reachable around the gap. Goal cells for
+    /// `enemy_line` sit inside the rectangle so the field connects end to end.
+    fn walled_field(w: &mut World, wall_q: i32, gap_r: i32) {
+        let mut t = w.resource_mut::<TerrainMap>();
+        for q in -31..=3 {
+            for r in -3..=3 {
+                t.set(Hex::new(q, r), Terrain::Plains);
+            }
+        }
+        for r in -3..=3 {
+            if r != gap_r {
+                t.set(Hex::new(wall_q, r), Terrain::Mountain);
+            }
+        }
+    }
+
+    #[test]
+    fn flow_step_escapes_a_greedy_dead_end() {
+        // A unit pressed against the wall at (2,0) has no neighbor that reduces
+        // straight-line distance to the enemy line without crossing a mountain,
+        // so the greedy step dead-ends. The flow field knows the only route is up
+        // toward the gap, so it still yields a (strictly closer) step.
+        let mut w = fresh_world();
+        walled_field(&mut w, 1, 3);
+        let terrain = w.remove_resource::<TerrainMap>().unwrap();
+        let idx = SpatialIndex::default();
+        let reserved = HashSet::new();
+
+        let mut field = FlowField::default();
+        field
+            .dist
+            .insert(Team::Blue, integrate(&terrain, enemy_line(Team::Blue)));
+
+        let from = Hex::new(2, 0);
+        assert!(
+            greedy_step(from, enemy_line(Team::Blue), &terrain, &idx, &reserved).is_none(),
+            "greedy must dead-end against the wall"
+        );
+
+        let dist = field.dist.get(&Team::Blue).unwrap();
+        let step = flow_step(&field, Team::Blue, from, &terrain, &idx, &reserved)
+            .expect("flow field must offer an escape step");
+        assert!(
+            dist[&(step.q, step.r)] < dist[&(from.q, from.r)],
+            "flow step must descend the gradient: {step:?}"
+        );
+        assert!(step.r > from.r, "the only route is up toward the gap: {step:?}");
+    }
+
+    #[test]
+    fn flow_field_routes_around_a_wall_with_no_enemy_in_sight() {
+        // No enemy in vision → the greedy-to-line fallback alone would stall at
+        // the wall. With the flow field the unit threads the gap and reaches the
+        // far side, never standing on a mountain.
+        let mut w = fresh_world();
+        walled_field(&mut w, 1, 3);
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(3, 0), 1)).id();
+
+        let mut crossed_onto_mountain = false;
+        for _ in 0..40 {
+            step(&mut w);
+            let h = *w.get::<Hex>(blue).expect("blue alive");
+            if w.resource::<TerrainMap>().get(h) == Terrain::Mountain {
+                crossed_onto_mountain = true;
+            }
+        }
+
+        let h = *w.get::<Hex>(blue).expect("blue alive");
+        assert!(!crossed_onto_mountain, "unit must never stand on a mountain");
+        assert!(
+            h.q <= 0,
+            "unit should round the wall and reach the far side, at {h:?}"
+        );
     }
 
     #[test]

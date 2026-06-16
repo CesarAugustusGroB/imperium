@@ -22,12 +22,15 @@ antes de comprometer el juego entero.
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
-  el enemigo visible (greedy en el avance abierto).
+  el enemigo visible. Sin enemigo a la vista siguen un **flow-field** (campo de
+  integración Dijkstra, uno por bando, calculado una sola vez) hacia la línea
+  enemiga — rodean obstáculos cóncavos donde el paso greedy se trababa, y todo
+  el ejército comparte un único campo (sin A\* por unidad).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  13 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -111,8 +114,9 @@ $msgs | & target\debug\imperium-mcp.exe
 
 ## Pendiente
 
-- **A\* a escala**: hoy se corre A* por unidad por tick (target dentro de VISION).
-  Para miles hay que throttlear/cachear el path o usar flow-fields.
+- **A\* a escala**: hoy se corre A* por unidad por tick hacia el enemigo *visible*
+  (target dentro de VISION). El avance sin enemigo a la vista ya usa flow-field
+  compartido; para miles hay que throttlear/cachear también el A* del contacto.
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
 - Órdenes restantes (retreat/unleash), tipos ranged (skirmishers).
