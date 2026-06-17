@@ -27,7 +27,11 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  17 tests).
+- **Proximidad por anillos**: la búsqueda del enemigo más cercano (movimiento y
+  tiro) recorre el disco hex **anillo por anillo hacia afuera y corta en el primer
+  anillo con un enemigo** — el caso común (enemigo adyacente) toca ~6 celdas en vez
+  de la caja completa `(2·VISION+1)²`. Acota el costo del probe por unidad por tick.
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
