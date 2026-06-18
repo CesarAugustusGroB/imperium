@@ -25,9 +25,13 @@ antes de comprometer el juego entero.
   el enemigo visible (greedy en el avance abierto).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
+- **Cohesión de formación**: en el avance abierto (sin enemigo a la vista, *March*),
+  una unidad que se adelantó más de `COHESION_SLACK` hexes del frente de su grupo
+  *espera* a que el bloque cierre, en vez de desgranarse en una línea fina. El
+  contacto manda: ver un enemigo (o cargar) anula la cohesión.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  15 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
