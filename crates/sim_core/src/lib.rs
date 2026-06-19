@@ -282,10 +282,18 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
     }
 }
 
-/// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
-/// within missile range. Charging melee attackers hit harder.
+/// Each unit lands ONE attack per tick. Melee attackers concentrate on a single
+/// adjacent enemy — the lowest-HP one, to secure kills (focus fire) — rather than
+/// striking every neighbor at once; skirmishers shoot the nearest enemy in
+/// missile range. Charging melee attackers hit harder.
+///
+/// Single-targeting is what makes flanking matter: a surrounded unit is struck by
+/// every neighbor but only strikes back at one, so being outnumbered in melee is
+/// lethal. (Previously a unit dealt its full damage to all six neighbors at once,
+/// which perversely rewarded being surrounded.)
 pub fn combat(
     units: Query<(&Hex, &Team, &Kind, &Group)>,
+    healths: Query<&Health>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     mut dmg: ResMut<DamageBuffer>,
@@ -293,18 +301,39 @@ pub fn combat(
     for (hex, team, kind, group) in &units {
         let order = orders.get(*team, group.0);
         let amount = attack_damage(*kind) + charge_bonus(*kind, order);
-        if attack_range(*kind) == 1 {
-            for n in hex.neighbors() {
-                if let Some((enemy, eteam)) = idx.at(n) {
-                    if eteam != *team {
-                        *dmg.0.entry(enemy).or_insert(0.0) += amount;
-                    }
-                }
-            }
-        } else if let Some(enemy) = nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind)) {
+        let target = if attack_range(*kind) == 1 {
+            weakest_adjacent_enemy(hex, *team, &idx, &healths)
+        } else {
+            nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind))
+        };
+        if let Some(enemy) = target {
             *dmg.0.entry(enemy).or_insert(0.0) += amount;
         }
     }
+}
+
+/// Lowest-HP enemy in one of `hex`'s six neighbors, or `None`. Ties break by the
+/// fixed neighbor order, so the choice is deterministic.
+fn weakest_adjacent_enemy(
+    hex: &Hex,
+    team: Team,
+    idx: &SpatialIndex,
+    healths: &Query<&Health>,
+) -> Option<Entity> {
+    let mut target: Option<Entity> = None;
+    let mut best_hp = f32::INFINITY;
+    for n in hex.neighbors() {
+        if let Some((enemy, eteam)) = idx.at(n) {
+            if eteam != team {
+                let hp = healths.get(enemy).map(|h| h.0).unwrap_or(f32::INFINITY);
+                if hp < best_hp {
+                    best_hp = hp;
+                    target = Some(enemy);
+                }
+            }
+        }
+    }
+    target
 }
 
 /// Apply accumulated damage; defenders on protective terrain and Hold orders
@@ -608,6 +637,77 @@ mod tests {
 
         let hp = w.get::<Health>(red).expect("red alive").0;
         assert!(hp < max_hp(Kind::Infantry), "red should have taken damage, hp={hp}");
+    }
+
+    #[test]
+    fn melee_attacks_a_single_enemy_not_all_neighbors() {
+        // One infantry flanked by two enemies should deal its damage to exactly
+        // one of them — total damage dealt == one attack, not two.
+        let mut w = fresh_world();
+        w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1));
+        let a = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1)).id();
+        let b = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, -1), 1)).id();
+
+        step(&mut w);
+
+        let max = max_hp(Kind::Infantry);
+        let dmg_a = max - w.get::<Health>(a).expect("a alive").0;
+        let dmg_b = max - w.get::<Health>(b).expect("b alive").0;
+        assert_eq!(
+            dmg_a + dmg_b,
+            attack_damage(Kind::Infantry),
+            "red must land exactly one melee attack, not one per neighbor (a={dmg_a}, b={dmg_b})"
+        );
+        assert!(
+            (dmg_a == 0.0) ^ (dmg_b == 0.0),
+            "exactly one neighbor should be struck (a={dmg_a}, b={dmg_b})"
+        );
+    }
+
+    #[test]
+    fn melee_focus_fire_targets_the_weakest_enemy() {
+        // Among two adjacent enemies, the already-wounded one is finished first.
+        let mut w = fresh_world();
+        w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1));
+        let weak = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1)).id();
+        let strong = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, -1), 1)).id();
+        w.get_mut::<Health>(weak).expect("weak alive").0 = 20.0;
+
+        step(&mut w);
+
+        assert!(
+            w.get::<Health>(weak).expect("weak alive").0 < 20.0,
+            "the wounded enemy should be focused"
+        );
+        assert_eq!(
+            w.get::<Health>(strong).expect("strong alive").0,
+            max_hp(Kind::Infantry),
+            "the healthy enemy should be left untouched while the weak one is focused"
+        );
+    }
+
+    #[test]
+    fn surrounded_unit_takes_more_than_it_deals() {
+        // A lone unit ringed by six enemies is struck by all of them but strikes
+        // back at only one — flanking is lethal.
+        let mut w = fresh_world();
+        let victim = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        let ring: Vec<Entity> = Hex::new(0, 0)
+            .neighbors()
+            .iter()
+            .map(|n| w.spawn(unit(Team::Blue, Kind::Infantry, *n, 1)).id())
+            .collect();
+
+        step(&mut w);
+
+        let max = max_hp(Kind::Infantry);
+        let dealt: f32 = ring
+            .iter()
+            .map(|e| max - w.get::<Health>(*e).map(|h| h.0).unwrap_or(0.0))
+            .sum();
+        let taken = max - w.get::<Health>(victim).expect("victim alive").0;
+        assert_eq!(dealt, attack_damage(Kind::Infantry), "victim strikes back at exactly one foe");
+        assert!(taken > dealt, "a surrounded unit takes far more than it deals (took {taken}, dealt {dealt})");
     }
 
     #[test]

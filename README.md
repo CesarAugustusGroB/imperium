@@ -25,9 +25,14 @@ antes de comprometer el juego entero.
   el enemigo visible (greedy en el avance abierto).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
+- **Combate enfocado**: cada unidad pega **un** ataque por tick. El melee
+  concentra el golpe en **un** enemigo adyacente (el de menor HP — *focus fire*,
+  para asegurar bajas) en vez de dañar a los seis a la vez. Así el flanqueo
+  importa: una unidad rodeada recibe de todos pero devuelve a uno → ser superado
+  en número en cuerpo a cuerpo es letal.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  14 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -128,3 +133,6 @@ $msgs | & target\debug\imperium-mcp.exe
 - Determinismo: el `Schedule` corre los sistemas con `.chain()` (orden secuencial).
 - Las entidades comparten componentes de sim (`Hex`, `Health`, `Team`) y de render
   (`Mesh2d`, ...). Cuando el sim hace `despawn`, el sprite desaparece solo.
+- Combate de objetivo único: `combat` ahora resuelve **un** ataque por unidad. El
+  melee elige al vecino enemigo de menor HP (desempate por el orden fijo de
+  vecinos → determinista); los skirmishers ya disparaban al más cercano.
