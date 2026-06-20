@@ -20,6 +20,9 @@ antes de comprometer el juego entero.
   un agente puede leer/mutar el juego corriendo (ver sección *Agentes*).
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
+  Las **montañas bloquean la línea de visión**: un skirmisher no puede disparar a
+  través de una montaña — apunta al enemigo *visible* más cercano (los extremos no
+  cuentan, así que un objetivo parado sobre una montaña sigue siendo disparable).
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
   el enemigo visible (greedy en el avance abierto).
@@ -27,7 +30,7 @@ antes de comprometer el juego entero.
   charge pega más, hold reduce daño.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  15 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 

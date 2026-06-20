@@ -39,6 +39,45 @@ impl Hex {
     pub fn distance(self, o: Hex) -> i32 {
         ((self.q - o.q).abs() + (self.q + self.r - o.q - o.r).abs() + (self.r - o.r).abs()) / 2
     }
+
+    /// The hexes the straight line from `self` to `o` passes through, endpoints
+    /// included, ordered from `self` to `o`. Uses cube-coordinate linear
+    /// interpolation with hex rounding (Red Blob Games). Deterministic.
+    pub fn line_to(self, o: Hex) -> Vec<Hex> {
+        let n = self.distance(o);
+        if n == 0 {
+            return vec![self];
+        }
+        // Cube coords: x=q, z=r, y=-x-z. Nudge endpoints by a tiny epsilon so a
+        // line that grazes a hex edge resolves consistently instead of flapping.
+        let (ax, ay, az) = (self.q as f32, (-self.q - self.r) as f32, self.r as f32);
+        let (bx, by, bz) = (o.q as f32, (-o.q - o.r) as f32, o.r as f32);
+        (0..=n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                cube_round(
+                    ax + (bx - ax) * t,
+                    ay + (by - ay) * t,
+                    az + (bz - az) * t,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Round fractional cube coords to the nearest hex, preserving x+y+z==0. We
+/// return only q (=x) and r (=z); the coordinate with the largest rounding
+/// error is recomputed from the other two so the triple stays consistent.
+fn cube_round(xf: f32, yf: f32, zf: f32) -> Hex {
+    let (mut x, y, mut z) = (xf.round(), yf.round(), zf.round());
+    let (dx, dy, dz) = ((x - xf).abs(), (y - yf).abs(), (z - zf).abs());
+    if dx > dy && dx > dz {
+        x = -y - z; // x had the worst error → derive it from y, z
+    } else if dz > dy {
+        z = -x - y; // z had the worst error → derive it from x, y
+    }
+    // Otherwise y was worst; we discard it, so x and z need no correction.
+    Hex::new(x as i32, z as i32)
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +111,13 @@ impl Terrain {
             Terrain::Hill => 0.6,
             _ => 1.0,
         }
+    }
+    /// Whether this terrain blocks ranged line of sight when it lies *between*
+    /// a shooter and its target. Mountains are tall enough that missiles cannot
+    /// pass through them; everything else (including water, which arrows fly
+    /// over) is clear. Only intervening hexes block — see `line_of_sight`.
+    pub fn blocks_sight(self) -> bool {
+        matches!(self, Terrain::Mountain)
     }
 }
 
@@ -288,6 +334,7 @@ pub fn combat(
     units: Query<(&Hex, &Team, &Kind, &Group)>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
+    terrain: Res<TerrainMap>,
     mut dmg: ResMut<DamageBuffer>,
 ) {
     for (hex, team, kind, group) in &units {
@@ -301,7 +348,9 @@ pub fn combat(
                     }
                 }
             }
-        } else if let Some(enemy) = nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind)) {
+        } else if let Some(enemy) =
+            nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind), &terrain)
+        {
             *dmg.0.entry(enemy).or_insert(0.0) += amount;
         }
     }
@@ -465,8 +514,28 @@ fn nearest_enemy(idx: &SpatialIndex, from: Hex, team: Team) -> Option<Hex> {
     best
 }
 
-/// Entity of the closest enemy within `range` (for ranged attacks).
-fn nearest_enemy_entity(idx: &SpatialIndex, from: Hex, team: Team, range: i32) -> Option<Entity> {
+/// Whether nothing sight-blocking (a mountain) sits strictly between `from` and
+/// `to`. The endpoints never block: a target standing on a mountain is still
+/// shootable, and a shooter on one can still fire out.
+pub fn line_of_sight(from: Hex, to: Hex, terrain: &TerrainMap) -> bool {
+    let line = from.line_to(to);
+    // Skip the first and last hexes (the endpoints).
+    line[1..line.len().saturating_sub(1)]
+        .iter()
+        .all(|h| !terrain.get(*h).blocks_sight())
+}
+
+/// Entity of the closest enemy within `range` that the shooter has line of
+/// sight to (mountains block missiles). Returns the nearest *unobstructed* foe,
+/// so a skirmisher whose closest enemy hides behind a mountain still shoots a
+/// farther one it can actually see.
+fn nearest_enemy_entity(
+    idx: &SpatialIndex,
+    from: Hex,
+    team: Team,
+    range: i32,
+    terrain: &TerrainMap,
+) -> Option<Entity> {
     let mut best = None;
     let mut best_d = i32::MAX;
     for dq in -range..=range {
@@ -477,7 +546,7 @@ fn nearest_enemy_entity(idx: &SpatialIndex, from: Hex, team: Team, range: i32) -
                 continue;
             }
             if let Some((e, t)) = idx.at(h) {
-                if t != team && d < best_d {
+                if t != team && d < best_d && line_of_sight(from, h, terrain) {
                     best_d = d;
                     best = Some(e);
                 }
@@ -747,6 +816,72 @@ mod tests {
         assert_eq!(ai_order(10, 10, 3), Order::Charge, "contact + not behind → launch");
         assert_eq!(ai_order(8, 10, 3), Order::Hold, "contact, slightly behind → hold");
         assert_eq!(ai_order(5, 10, 3), Order::Hold, "outnumbered → defend");
+    }
+
+    #[test]
+    fn line_to_is_contiguous_and_hits_both_endpoints() {
+        let a = Hex::new(0, 0);
+        let b = Hex::new(3, -1);
+        let line = a.line_to(b);
+        assert_eq!(line.first(), Some(&a));
+        assert_eq!(line.last(), Some(&b));
+        assert_eq!(line.len() as i32, a.distance(b) + 1, "one hex per step plus the start");
+        // Each consecutive pair is adjacent (distance 1).
+        for pair in line.windows(2) {
+            assert_eq!(pair[0].distance(pair[1]), 1, "line must be contiguous: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn mountains_block_line_of_sight_but_endpoints_do_not() {
+        let mut w = fresh_world();
+        let from = Hex::new(0, 0);
+        let to = Hex::new(3, 0);
+        // Clear line first.
+        assert!(line_of_sight(from, to, &w.resource::<TerrainMap>()), "plains is clear");
+        // A mountain strictly between blocks.
+        w.resource_mut::<TerrainMap>().set(Hex::new(2, 0), Terrain::Mountain);
+        assert!(!line_of_sight(from, to, &w.resource::<TerrainMap>()), "intervening mountain blocks");
+        // A mountain on the *target* hex does not block (endpoints excluded).
+        let mut clear = fresh_world();
+        clear.resource_mut::<TerrainMap>().set(to, Terrain::Mountain);
+        assert!(line_of_sight(from, to, &clear.resource::<TerrainMap>()), "target on a mountain is still visible");
+    }
+
+    #[test]
+    fn skirmishers_cannot_shoot_through_a_mountain() {
+        let mut w = fresh_world();
+        // Wall the line between shooter (0,0) and target (3,0).
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            t.set(Hex::new(1, 0), Terrain::Mountain);
+            t.set(Hex::new(2, 0), Terrain::Mountain);
+        }
+        w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1));
+        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(3, 0), 1)).id();
+
+        step(&mut w);
+
+        let hp = w.get::<Health>(blue).expect("blue alive").0;
+        assert_eq!(hp, max_hp(Kind::Infantry), "shot must be blocked by the mountain, hp={hp}");
+    }
+
+    #[test]
+    fn skirmishers_shoot_a_visible_foe_past_an_obstructed_one() {
+        let mut w = fresh_world();
+        w.resource_mut::<TerrainMap>().set(Hex::new(1, 0), Terrain::Mountain);
+        w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1));
+        // Obstructed enemy directly behind the mountain (distance 2).
+        let hidden = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, 0), 1)).id();
+        // Equally-close enemy on a clear line (distance 2).
+        let visible = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 2), 1)).id();
+
+        step(&mut w);
+
+        let hidden_hp = w.get::<Health>(hidden).expect("hidden alive").0;
+        let visible_hp = w.get::<Health>(visible).expect("visible alive").0;
+        assert_eq!(hidden_hp, max_hp(Kind::Infantry), "hidden foe must be safe behind the mountain");
+        assert!(visible_hp < max_hp(Kind::Infantry), "the unobstructed foe should be shot, hp={visible_hp}");
     }
 
     #[test]
