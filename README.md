@@ -25,9 +25,13 @@ antes de comprometer el juego entero.
   el enemigo visible (greedy en el avance abierto).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
+- **Flanqueo**: un golpe cuerpo a cuerpo pega más fuerte cuando varios aliados
+  rodean al mismo defensor (`+15%` por atacante extra adyacente, hasta `+75%` si
+  está totalmente rodeado). Premia la concentración de fuerzas y el cerco; es
+  determinista (lee solo el índice espacial, no el orden de iteración).
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  13 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
