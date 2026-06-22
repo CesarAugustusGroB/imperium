@@ -22,6 +22,9 @@ antes de comprometer el juego entero.
   un agente puede leer/mutar el juego corriendo (ver sección *Agentes*).
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
   ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
+  Las **montañas bloquean la línea de visión**: un skirmisher no puede disparar a
+  través de una montaña — apunta al enemigo *visible* más cercano (los extremos no
+  cuentan, así que un objetivo parado sobre una montaña sigue siendo disparable).
   Generación determinista por semilla (hash noise, sin deps).
 - **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
   el enemigo visible (greedy en el avance abierto).
