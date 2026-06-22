@@ -951,49 +951,48 @@ fn flow_step(
     }
 }
 
-/// Closest enemy within VISION, found by a range-bounded scan of the index
-/// (not an all-pairs sweep) — the property that keeps the tick bounded at scale.
-fn nearest_enemy(idx: &SpatialIndex, from: Hex, team: Team) -> Option<Hex> {
-    let mut best = None;
-    let mut best_d = i32::MAX;
-    for dq in -VISION..=VISION {
-        for dr in -VISION..=VISION {
-            let h = Hex::new(from.q + dq, from.r + dr);
-            let d = from.distance(h);
-            if d == 0 || d > VISION {
-                continue;
-            }
-            if let Some((_, t)) = idx.at(h) {
-                if t != team && d < best_d {
-                    best_d = d;
-                    best = Some(h);
+/// Nearest enemy within `range`, scanning the hex disk **ring by ring outward**
+/// and stopping at the first ring that holds one — so a unit with an adjacent
+/// foe touches ~6 cells instead of the whole `(2·range+1)²` bounding box. This
+/// is the property that keeps the proximity probe cheap at scale: the common
+/// case (an enemy nearby) costs O(closest ring), and even the empty case walks
+/// the disk (≈3·range²) rather than the larger square. Every cell of a ring is
+/// equidistant from `from`, so the first hit in a ring is a true nearest; ties
+/// resolve by the fixed ring-walk order, keeping the scan deterministic.
+fn nearest_enemy_in_range(
+    idx: &SpatialIndex,
+    from: Hex,
+    team: Team,
+    range: i32,
+) -> Option<(Entity, Hex)> {
+    for radius in 1..=range {
+        // Walk the ring of `radius` cells around `from` (red-blob algorithm:
+        // start at the corner `DIRS[4]·radius` away, then trace each of the six
+        // sides). No allocation — the hot path runs this per unit per tick.
+        let (sq, sr) = DIRS[4];
+        let mut h = Hex::new(from.q + sq * radius, from.r + sr * radius);
+        for (dq, dr) in DIRS {
+            for _ in 0..radius {
+                if let Some((e, t)) = idx.at(h) {
+                    if t != team {
+                        return Some((e, h));
+                    }
                 }
+                h = Hex::new(h.q + dq, h.r + dr);
             }
         }
     }
-    best
+    None
+}
+
+/// Closest enemy hex within VISION (movement target).
+fn nearest_enemy(idx: &SpatialIndex, from: Hex, team: Team) -> Option<Hex> {
+    nearest_enemy_in_range(idx, from, team, VISION).map(|(_, h)| h)
 }
 
 /// Entity of the closest enemy within `range` (for ranged attacks).
 fn nearest_enemy_entity(idx: &SpatialIndex, from: Hex, team: Team, range: i32) -> Option<Entity> {
-    let mut best = None;
-    let mut best_d = i32::MAX;
-    for dq in -range..=range {
-        for dr in -range..=range {
-            let h = Hex::new(from.q + dq, from.r + dr);
-            let d = from.distance(h);
-            if d == 0 || d > range {
-                continue;
-            }
-            if let Some((e, t)) = idx.at(h) {
-                if t != team && d < best_d {
-                    best_d = d;
-                    best = Some(e);
-                }
-            }
-        }
-    }
-    best
+    nearest_enemy_in_range(idx, from, team, range).map(|(e, _)| e)
 }
 
 /// Free, passable neighbor that moves away from `enemy` (skirmisher kiting).
@@ -1892,6 +1891,60 @@ mod tests {
         }
     }
 
+    // --- ring-scan nearest-enemy probe -------------------------------------
+
+    /// Build a spatial index directly from `(hex, team)` pairs. Entities are
+    /// placeholders — the scan only reads position/team and returns them.
+    fn idx_from(cells: &[(Hex, Team)]) -> SpatialIndex {
+        let mut idx = SpatialIndex::default();
+        if let (Some(q_min), Some(q_max), Some(r_min), Some(r_max)) = (
+            cells.iter().map(|(h, _)| h.q).min(),
+            cells.iter().map(|(h, _)| h.q).max(),
+            cells.iter().map(|(h, _)| h.r).min(),
+            cells.iter().map(|(h, _)| h.r).max(),
+        ) {
+            idx.reset(Some((q_min, r_min, q_max, r_max)));
+            for (h, t) in cells {
+                idx.set(*h, Entity::PLACEHOLDER, *t);
+            }
+        }
+        idx
+    }
+
+    #[test]
+    fn ring_scan_returns_an_enemy_at_the_minimum_distance() {
+        let from = Hex::new(0, 0);
+        // Three enemies at distances 5, 2 and 3 — the nearest is at distance 2.
+        let idx = idx_from(&[
+            (Hex::new(5, 0), Team::Blue),
+            (Hex::new(2, -1), Team::Blue),
+            (Hex::new(0, 3), Team::Blue),
+        ]);
+        let got = nearest_enemy(&idx, from, Team::Red).expect("an enemy is in range");
+        assert_eq!(from.distance(got), 2, "must return a closest enemy, got {got:?}");
+    }
+
+    #[test]
+    fn ring_scan_visits_every_cell_of_a_ring() {
+        // For each cell at distance 2, a lone enemy placed there must be found —
+        // proving the ring walk reaches the whole ring (no gaps).
+        let from = Hex::new(0, 0);
+        for dq in -2..=2 {
+            for dr in -2..=2 {
+                let h = Hex::new(dq, dr);
+                if from.distance(h) != 2 {
+                    continue;
+                }
+                let idx = idx_from(&[(h, Team::Blue)]);
+                assert_eq!(
+                    nearest_enemy(&idx, from, Team::Red),
+                    Some(h),
+                    "ring scan missed {h:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn default_catalog_loops_holds_but_not_one_shots() {
         let v = AnimCatalog::default().get(Kind::Infantry).clone();
@@ -1911,6 +1964,56 @@ mod tests {
             paths.iter().collect::<std::collections::HashSet<_>>().len(),
             3,
             "kinds should map to distinct sheets: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn ring_scan_matches_a_brute_force_minimum() {
+        // A scattered field (incl. equidistant ties and own-team decoys); the
+        // returned enemy must sit at the true minimum distance, and the team
+        // filter must skip friendlies.
+        let from = Hex::new(0, 0);
+        let field = [
+            (Hex::new(4, 0), Team::Blue),
+            (Hex::new(-3, 1), Team::Blue),
+            (Hex::new(2, 1), Team::Blue),  // dist 3
+            (Hex::new(-2, -1), Team::Blue), // dist 3 (tie)
+            (Hex::new(1, 0), Team::Red),   // friendly, must be ignored
+        ];
+        let idx = idx_from(&field);
+        let got = nearest_enemy(&idx, from, Team::Red).expect("enemy in range");
+        let min_d = field
+            .iter()
+            .filter(|(_, t)| *t == Team::Blue)
+            .map(|(h, _)| from.distance(*h))
+            .min()
+            .unwrap();
+        assert_eq!(from.distance(got), min_d, "got {got:?}, expected distance {min_d}");
+        assert_ne!(got, Hex::new(1, 0), "must not target a friendly");
+    }
+
+    #[test]
+    fn ring_scan_ignores_enemies_beyond_range() {
+        let from = Hex::new(0, 0);
+        // Only enemy sits past VISION → out of range, nothing found.
+        let idx = idx_from(&[(Hex::new(VISION + 3, 0), Team::Blue)]);
+        assert_eq!(nearest_enemy(&idx, from, Team::Red), None);
+    }
+
+    #[test]
+    fn ring_scan_entity_targets_the_closest_foe() {
+        // Distinct entities: the ranged target must be the nearer one.
+        let mut w = World::new();
+        let near = w.spawn((Hex::new(1, 0), Team::Blue)).id();
+        let far = w.spawn((Hex::new(3, 0), Team::Blue)).id();
+        let mut idx = SpatialIndex::default();
+        idx.reset(Some((1, 0, 3, 0)));
+        idx.set(Hex::new(1, 0), near, Team::Blue);
+        idx.set(Hex::new(3, 0), far, Team::Blue);
+        assert_eq!(
+            nearest_enemy_entity(&idx, Hex::new(0, 0), Team::Red, 3),
+            Some(near),
+            "ranged attack must pick the nearest enemy"
         );
     }
 
@@ -1958,5 +2061,27 @@ mod tests {
             Order::Hold,
             "outnumbered at scale → defend"
         );
+    }
+
+    #[test]
+    fn proximity_scan_holds_up_at_scale() {
+        // Stress/smoke for the hot scan: two ~600-unit blocks collide for 40
+        // ticks. Asserts panic-free and a monotonically non-increasing count —
+        // every moving unit runs the ring scan each tick.
+        let mut w = fresh_world();
+        for q in 0..30 {
+            for r in 0..20 {
+                w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(q, r), 1));
+                w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(q + 31, r), 1));
+            }
+        }
+        let count = |w: &mut World| w.query::<&Team>().iter(w).count();
+        let mut prev = count(&mut w);
+        for _ in 0..40 {
+            step(&mut w);
+            let now = count(&mut w);
+            assert!(now <= prev, "unit count must not grow: {prev} -> {now}");
+            prev = now;
+        }
     }
 }
