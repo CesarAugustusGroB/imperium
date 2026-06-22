@@ -723,9 +723,13 @@ pub fn movement(
         // Prefer the A*-routed next hex toward a visible enemy; fall back to a
         // greedy step (toward the enemy line, or when the A* hex is taken). The
         // A* route is cached and re-planned only periodically (see PathCache).
+        // When even the greedy step is blocked — a unit boxed in by its own
+        // packed ranks — slip sideways (a free neighbor that holds distance) so
+        // the column flows around the jam instead of deadlocking behind it.
         let step = match enemy.and_then(|e| cached_step(from, e, &terrain, now, &mut cache)) {
             Some(s) if !idx.occupied(s) && !reserved.contains(&(s.q, s.r)) => Some(s),
-            _ => greedy_step(from, goal, &terrain, &idx, &reserved),
+            _ => greedy_step(from, goal, &terrain, &idx, &reserved)
+                .or_else(|| sidestep(from, goal, &terrain, &idx, &reserved)),
         };
 
         if let Some(n) = step {
@@ -809,6 +813,34 @@ fn greedy_step(
         Some(n) if n.distance(goal) < from.distance(goal) => Some(n),
         _ => None,
     }
+}
+
+/// Anti-gridlock valve: when no neighbor makes progress toward `goal` (every
+/// distance-reducing hex is taken), slip to a free neighbor that at least *holds*
+/// the distance, letting a stalled unit flow laterally around the jam ahead. It
+/// never steps backward (a strictly-farther hex is no better than waiting), so
+/// units don't scatter — they only peel sideways when genuinely boxed in.
+fn sidestep(
+    from: Hex,
+    goal: Hex,
+    terrain: &TerrainMap,
+    idx: &SpatialIndex,
+    reserved: &HashSet<(i32, i32)>,
+) -> Option<Hex> {
+    let cur = from.distance(goal);
+    let mut best: Option<Hex> = None;
+    let mut best_d = i32::MAX;
+    for n in from.neighbors() {
+        if !terrain.get(n).passable() || idx.occupied(n) || reserved.contains(&(n.q, n.r)) {
+            continue;
+        }
+        let d = n.distance(goal);
+        if d <= cur && d < best_d {
+            best_d = d;
+            best = Some(n);
+        }
+    }
+    best
 }
 
 /// Closest enemy within VISION, found by a range-bounded scan of the index
@@ -1161,6 +1193,55 @@ mod tests {
 
         let h = *w.get::<Hex>(sk).expect("skirmisher alive");
         assert!(h.distance(Hex::new(1, 0)) >= 2, "skirmisher should kite away, at {h:?}");
+    }
+
+    #[test]
+    fn a_blocked_unit_sidesteps_instead_of_deadlocking() {
+        let mut w = fresh_world();
+        // Blue marches toward the −q enemy line. A held friendly sits squarely in
+        // the only distance-reducing hex (−1,0) directly ahead of the rear unit at
+        // (0,0). Pre-sidestep the rear unit would freeze; it must now peel laterally
+        // to a hex that holds its distance to the goal (not backward, not onto the
+        // blocker).
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::March);
+        w.resource_mut::<Orders>().set(Team::Blue, 2, Order::Hold);
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(-1, 0), 2)); // the blocker
+        let rear = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 0), 1)).id();
+
+        let goal_d = |h: Hex| h.distance(enemy_line(Team::Blue));
+        let before = goal_d(Hex::new(0, 0));
+
+        step(&mut w);
+
+        let h = *w.get::<Hex>(rear).expect("rear alive");
+        assert_ne!(h, Hex::new(0, 0), "boxed-in unit should peel sideways, not freeze");
+        assert_ne!(h, Hex::new(-1, 0), "must not step onto the blocker");
+        assert!(
+            goal_d(h) <= before,
+            "sidestep must hold (not lose) ground toward the goal: {h:?}"
+        );
+    }
+
+    #[test]
+    fn a_unit_does_not_sidestep_backward_when_fully_boxed() {
+        let mut w = fresh_world();
+        // Box the marcher in toward its goal: the three −q-ward neighbors of (0,0)
+        // — (−1,0), (−1,1), (0,−1) — are the only hexes that don't increase the
+        // distance to the (−30,0) line; wall them all. The unit must stay put
+        // rather than sidestep onto a strictly-farther hex.
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::March);
+        {
+            let mut t = w.resource_mut::<TerrainMap>();
+            t.set(Hex::new(-1, 0), Terrain::Mountain);
+            t.set(Hex::new(-1, 1), Terrain::Mountain);
+            t.set(Hex::new(0, -1), Terrain::Mountain);
+        }
+        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 0), 1)).id();
+
+        step(&mut w);
+
+        let h = *w.get::<Hex>(blue).expect("blue alive");
+        assert_eq!(h, Hex::new(0, 0), "fully boxed unit must not retreat sideways, at {h:?}");
     }
 
     #[test]
