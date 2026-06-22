@@ -553,6 +553,25 @@ pub struct FlowField {
     built: bool,
 }
 
+/// How far ahead of its group's front a unit may get before it pauses to let
+/// the formation close up (in hexes of advance toward the enemy line).
+pub const COHESION_SLACK: f32 = 4.0;
+
+/// Per-(team, group) formation state: the mean advance front, i.e. the average
+/// distance of the group's living members to their enemy line. Rebuilt each
+/// tick so cohesion tracks the formation as it moves and takes casualties.
+#[derive(Resource, Default)]
+pub struct Formations {
+    pub mean_dist: HashMap<(Team, u8), f32>,
+}
+
+impl Formations {
+    /// Mean distance-to-enemy-line for a group, or `None` if it has no members.
+    fn front(&self, team: Team, group: u8) -> Option<f32> {
+        self.mean_dist.get(&(team, group)).copied()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Systems — pipeline order mirrors simulateTick's phases.
 // ---------------------------------------------------------------------------
@@ -638,6 +657,23 @@ fn integrate(terrain: &TerrainMap, goal: Hex) -> HashMap<(i32, i32), u32> {
     dist
 }
 
+/// Compute each group's average distance to its enemy line — the formation's
+/// advance "front". `movement` reads this so a unit that has outrun its group
+/// can pause and let the block catch up. O(units), no proximity queries.
+pub fn build_formations(units: Query<(&Hex, &Team, &Group)>, mut formations: ResMut<Formations>) {
+    let mut sum: HashMap<(Team, u8), (i64, u32)> = HashMap::new();
+    for (hex, team, group) in &units {
+        let d = hex.distance(enemy_line(*team)) as i64;
+        let acc = sum.entry((*team, group.0)).or_insert((0, 0));
+        acc.0 += d;
+        acc.1 += 1;
+    }
+    formations.mean_dist.clear();
+    for (key, (total, count)) in sum {
+        formations.mean_dist.insert(key, total as f32 / count as f32);
+    }
+}
+
 /// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
 /// within missile range. Charging melee attackers hit harder.
 pub fn combat(
@@ -718,6 +754,7 @@ pub fn movement(
     terrain: Res<TerrainMap>,
     mut moved: ResMut<MovedThisTick>,
     field: Res<FlowField>,
+    formations: Res<Formations>,
     mut units: Query<(
         Entity,
         &mut Hex,
@@ -783,6 +820,20 @@ pub fn movement(
             .any(|n| matches!(idx.at(*n), Some((_, t)) if t != *team));
         if fighting {
             continue;
+        }
+
+        // Formation cohesion: on the open advance (no enemy in sight, plain
+        // March) a unit that has pushed more than COHESION_SLACK ahead of its
+        // group's front pauses, letting the block close up instead of smearing
+        // into a thin line. Committed orders (Charge/Unleash) and any unit that
+        // can see an enemy ignore cohesion — contact always overrides ranks.
+        if enemy.is_none() && order == Order::March {
+            if let Some(front) = formations.front(*team, group.0) {
+                let my_dist = from.distance(enemy_line(*team)) as f32;
+                if my_dist + COHESION_SLACK < front {
+                    continue; // ahead of the pack — hold for the formation
+                }
+            }
         }
 
         // With an enemy in sight, route to it along a **cached** A* path
@@ -1135,6 +1186,7 @@ pub fn step(world: &mut World) {
             tick_and_clear,
             build_spatial_index,
             build_flow_fields,
+            build_formations,
             combat,
             resolve_damage,
             movement,
@@ -1159,6 +1211,7 @@ mod tests {
         w.insert_resource(BattleEvents::default());
         w.insert_resource(MovedThisTick::default());
         w.insert_resource(FlowField::default());
+        w.insert_resource(Formations::default());
         w
     }
 
@@ -1640,6 +1693,81 @@ mod tests {
             h.q <= 0,
             "unit should round the wall and reach the far side, at {h:?}"
         );
+    }
+
+    #[test]
+    fn cohesion_holds_back_a_unit_that_outran_its_group() {
+        // A Blue group: most of the block sits deep at q=20, but one runner has
+        // pushed far ahead to q=2 (much closer to Red's line at q=-30). No enemy
+        // is anywhere in vision, so the runner should pause for cohesion while
+        // the trailing block keeps advancing — shrinking the spread.
+        let mut w = fresh_world();
+        let runner = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, 0), 1)).id();
+        let mut rear = Vec::new();
+        for r in 0..6 {
+            rear.push(w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(20, r), 1)).id());
+        }
+
+        let runner_before = w.get::<Hex>(runner).unwrap().q;
+        step(&mut w);
+
+        let runner_after = w.get::<Hex>(runner).unwrap().q;
+        assert_eq!(
+            runner_after, runner_before,
+            "the runner is far ahead of its group's front and must hold for cohesion"
+        );
+        // ...while a rear unit (behind the mean) advances to close the gap.
+        let rear_after = w.get::<Hex>(rear[0]).unwrap().q;
+        assert!(rear_after < 20, "a trailing unit should keep advancing, at q={rear_after}");
+    }
+
+    #[test]
+    fn a_lagging_unit_still_advances_toward_the_front() {
+        // Mirror image: the unit under test is *behind* its group's front, so it
+        // must advance (catch up), never pause.
+        let mut w = fresh_world();
+        for r in 0..6 {
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, r), 1));
+        }
+        let laggard = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(20, 0), 1)).id();
+
+        step(&mut w);
+
+        let q = w.get::<Hex>(laggard).unwrap().q;
+        assert!(q < 20, "a lagging unit must advance to catch its group, at q={q}");
+    }
+
+    #[test]
+    fn cohesion_never_freezes_a_lone_unit() {
+        // Regression guard for `isolated_unit_marches_*`: a group of one is its
+        // own front, so cohesion can never apply and it must still advance.
+        let mut w = fresh_world();
+        let solo = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        step(&mut w);
+
+        let q = w.get::<Hex>(solo).unwrap().q;
+        assert!(q < 10, "a lone unit must keep marching, at q={q}");
+    }
+
+    #[test]
+    fn cohesion_yields_to_a_visible_enemy() {
+        // The runner is far ahead of its group's front, but an enemy sits within
+        // vision. Contact overrides cohesion: it must engage, not hold for ranks.
+        let mut w = fresh_world();
+        let runner = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, 0), 1)).id();
+        w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(-4, 0), 1)); // within VISION of the runner
+        for r in 0..6 {
+            w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(20, r), 1));
+        }
+
+        let before = *w.get::<Hex>(runner).unwrap();
+        step(&mut w);
+
+        let after = *w.get::<Hex>(runner).unwrap();
+        assert_ne!(after, before, "a unit that can see an enemy must move despite cohesion");
+        assert!(after.distance(Hex::new(-4, 0)) < before.distance(Hex::new(-4, 0)),
+            "it should close on the visible enemy, at {after:?}");
     }
 
     #[test]
