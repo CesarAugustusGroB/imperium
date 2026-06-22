@@ -10,8 +10,9 @@ use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
-    generate_terrain, unit, AnimCatalog, AnimState, BattleEvents, DamageBuffer, Group, Health, Hex,
-    Kind, MovedThisTick, NextMove, Order, Orders, SpatialIndex, Team, Terrain, TerrainMap, Tick,
+    generate_terrain, unit, AnimCatalog, AnimState, BattleEvents, DamageBuffer, FlowField, Group,
+    Health, Hex, Kind, MovedThisTick, NextMove, Order, Orders, SpatialIndex, Team, Terrain,
+    TerrainMap, Tick,
 };
 
 const HEX_SIZE: f32 = 12.0;
@@ -56,12 +57,14 @@ fn main() {
         .insert_resource(BattleEvents::default())
         .insert_resource(MovedThisTick::default())
         .insert_resource(AnimCatalog::default())
+        .insert_resource(FlowField::default())
         .add_systems(Startup, setup)
         .add_systems(
             FixedUpdate,
             (
                 sim_core::tick_and_clear,
                 sim_core::build_spatial_index,
+                sim_core::build_flow_fields,
                 sim_core::enemy_ai,
                 sim_core::combat,
                 sim_core::resolve_damage,
