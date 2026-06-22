@@ -156,6 +156,22 @@ pub struct Group(pub u8);
 #[reflect(Component)]
 pub struct NextMove(pub u64);
 
+/// Animation state of a unit, recomputed every tick from what the unit *did*
+/// (see [`animate`]). The render crate keys sprite clips off this — `sim_core`
+/// only sets the state, it never renders. `Die` is part of the contract (the
+/// catalog has a death clip) but is **never** assigned to a live unit: dead
+/// units are despawned, so death is surfaced as a [`DeathEvent`] instead.
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[reflect(Component)]
+pub enum AnimState {
+    #[default]
+    Idle,
+    Move,
+    Attack,
+    Hit,
+    Die,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Order {
     /// Stand still, do nothing offensive beyond defending.
@@ -247,7 +263,43 @@ fn move_period(kind: Kind, order: Order) -> u64 {
 /// Component bundle for one unit. Shared by the headless tests and the Bevy
 /// game (which adds render components alongside it on the same entity).
 pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
-    (hex, Health(max_hp(kind)), team, kind, Group(group), NextMove(0))
+    (
+        hex,
+        Health(max_hp(kind)),
+        team,
+        kind,
+        Group(group),
+        NextMove(0),
+        AnimState::default(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Sim events — discrete things the render/audio layer keys animations off.
+// Stored in the [`BattleEvents`] log (cleared each tick) rather than Bevy
+// `Events<T>` so the headless `step` stays a plain chained schedule with no
+// double-buffer update cycle; the render crate can forward them to an
+// `EventWriter` if it prefers.
+// ---------------------------------------------------------------------------
+
+/// One unit struck another this tick (pre-mitigation). `at` is the attacker's
+/// hex — enough for a render layer to spawn a swing/missile effect.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttackEvent {
+    pub attacker: Entity,
+    pub target: Entity,
+    pub kind: Kind,
+    pub at: Hex,
+}
+
+/// A unit died this tick. Carries team/kind/hex because the entity is despawned
+/// the same tick, so the render layer cannot look them up afterward.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeathEvent {
+    pub entity: Entity,
+    pub team: Team,
+    pub kind: Kind,
+    pub at: Hex,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,13 +342,133 @@ impl SpatialIndex {
 #[derive(Resource, Default)]
 pub struct DamageBuffer(pub HashMap<Entity, f32>);
 
+/// Per-tick log of sim events the render/audio layer consumes. Cleared at the
+/// start of every tick in [`tick_and_clear`]; read after [`step`] returns.
+#[derive(Resource, Default)]
+pub struct BattleEvents {
+    pub attacks: Vec<AttackEvent>,
+    pub deaths: Vec<DeathEvent>,
+}
+
+/// Scratch: entities that changed hex this tick (drives the `Move` animation
+/// state). Cleared each tick. Kept separate from [`BattleEvents`] because
+/// movement is continuous state, not a discrete gameplay event.
+#[derive(Resource, Default)]
+pub struct MovedThisTick(pub HashSet<Entity>);
+
+// ---------------------------------------------------------------------------
+// Animation asset catalog — a typed schema the render crate consumes to map a
+// unit's (Kind, AnimState) to concrete sprite-sheet frames. Pure data: no Bevy
+// asset handles here (that would pull rendering into the headless crate). The
+// real art (paths + frame counts) is the human's job; this is the contract.
+// ---------------------------------------------------------------------------
+
+/// One animation clip: a contiguous run of frames in a sprite sheet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimClip {
+    /// Index of the first frame in the sheet.
+    pub first: u32,
+    /// Number of frames in the clip.
+    pub len: u32,
+    /// Playback rate, frames per second.
+    pub fps: f32,
+    /// `true` for states that hold (idle/move), `false` for one-shots
+    /// (attack/hit/die) the render layer plays once.
+    pub looping: bool,
+}
+
+/// Sprite-sheet (texture atlas) description for one unit kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpriteSheet {
+    /// Asset path relative to the render crate's asset root. Placeholder until
+    /// art exists.
+    pub path: &'static str,
+    /// Pixel size of a single frame; frames are uniform.
+    pub tile: (u32, u32),
+    /// Frames per row in the atlas.
+    pub columns: u32,
+}
+
+/// A unit kind's full visual: its sheet plus a clip for every [`AnimState`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnitVisual {
+    pub sheet: SpriteSheet,
+    pub idle: AnimClip,
+    pub moving: AnimClip,
+    pub attack: AnimClip,
+    pub hit: AnimClip,
+    pub die: AnimClip,
+}
+
+impl UnitVisual {
+    /// The clip for a given state — the per-frame lookup the render crate makes
+    /// from a unit's [`AnimState`].
+    pub fn clip(&self, state: AnimState) -> AnimClip {
+        match state {
+            AnimState::Idle => self.idle,
+            AnimState::Move => self.moving,
+            AnimState::Attack => self.attack,
+            AnimState::Hit => self.hit,
+            AnimState::Die => self.die,
+        }
+    }
+}
+
+/// Per-kind visual catalog. A [`Resource`] so the game inserts it once and the
+/// render systems read it; absent from the headless `step` pipeline.
+#[derive(Resource, Clone, Debug)]
+pub struct AnimCatalog {
+    pub infantry: UnitVisual,
+    pub cavalry: UnitVisual,
+    pub skirmisher: UnitVisual,
+}
+
+impl AnimCatalog {
+    pub fn get(&self, kind: Kind) -> &UnitVisual {
+        match kind {
+            Kind::Infantry => &self.infantry,
+            Kind::Cavalry => &self.cavalry,
+            Kind::Skirmisher => &self.skirmisher,
+        }
+    }
+}
+
+impl Default for AnimCatalog {
+    /// A placeholder layout: 5 states laid out in rows of an 8-column atlas.
+    /// The frame counts/paths are stand-ins so the render crate can wire up
+    /// against a real schema before the art lands.
+    fn default() -> Self {
+        let visual = |path| UnitVisual {
+            sheet: SpriteSheet { path, tile: (32, 32), columns: 8 },
+            idle: AnimClip { first: 0, len: 8, fps: 6.0, looping: true },
+            moving: AnimClip { first: 8, len: 8, fps: 10.0, looping: true },
+            attack: AnimClip { first: 16, len: 8, fps: 12.0, looping: false },
+            hit: AnimClip { first: 24, len: 4, fps: 12.0, looping: false },
+            die: AnimClip { first: 32, len: 6, fps: 8.0, looping: false },
+        };
+        Self {
+            infantry: visual("units/infantry.png"),
+            cavalry: visual("units/cavalry.png"),
+            skirmisher: visual("units/skirmisher.png"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Systems — pipeline order mirrors simulateTick's phases.
 // ---------------------------------------------------------------------------
 
-pub fn tick_and_clear(mut tick: ResMut<Tick>, mut dmg: ResMut<DamageBuffer>) {
+pub fn tick_and_clear(
+    mut tick: ResMut<Tick>,
+    mut dmg: ResMut<DamageBuffer>,
+    mut events: ResMut<BattleEvents>,
+    mut moved: ResMut<MovedThisTick>,
+) {
     tick.0 += 1;
     dmg.0.clear();
+    events.attacks.clear();
+    events.deaths.clear();
+    moved.0.clear();
 }
 
 pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<SpatialIndex>) {
@@ -309,12 +481,13 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
 /// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
 /// within missile range. Charging melee attackers hit harder.
 pub fn combat(
-    units: Query<(&Hex, &Team, &Kind, &Group)>,
+    units: Query<(Entity, &Hex, &Team, &Kind, &Group)>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     mut dmg: ResMut<DamageBuffer>,
+    mut events: ResMut<BattleEvents>,
 ) {
-    for (hex, team, kind, group) in &units {
+    for (me, hex, team, kind, group) in &units {
         let order = orders.get(*team, group.0);
         let amount = attack_damage(*kind) + charge_bonus(*kind, order);
         if attack_range(*kind) == 1 {
@@ -322,11 +495,23 @@ pub fn combat(
                 if let Some((enemy, eteam)) = idx.at(n) {
                     if eteam != *team {
                         *dmg.0.entry(enemy).or_insert(0.0) += amount;
+                        events.attacks.push(AttackEvent {
+                            attacker: me,
+                            target: enemy,
+                            kind: *kind,
+                            at: *hex,
+                        });
                     }
                 }
             }
         } else if let Some(enemy) = nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind)) {
             *dmg.0.entry(enemy).or_insert(0.0) += amount;
+            events.attacks.push(AttackEvent {
+                attacker: me,
+                target: enemy,
+                kind: *kind,
+                at: *hex,
+            });
         }
     }
 }
@@ -335,12 +520,13 @@ pub fn combat(
 /// take less. Despawn the dead before movement so movers skip corpses.
 pub fn resolve_damage(
     mut commands: Commands,
-    mut units: Query<(Entity, &mut Health, &Team, &Group, &Hex)>,
+    mut units: Query<(Entity, &mut Health, &Team, &Kind, &Group, &Hex)>,
     orders: Res<Orders>,
     terrain: Res<TerrainMap>,
     dmg: Res<DamageBuffer>,
+    mut events: ResMut<BattleEvents>,
 ) {
-    for (e, mut hp, team, group, hex) in &mut units {
+    for (e, mut hp, team, kind, group, hex) in &mut units {
         if let Some(d) = dmg.0.get(&e) {
             let mut incoming = *d * terrain.get(*hex).defense_mult();
             if orders.get(*team, group.0) == Order::Hold {
@@ -349,6 +535,12 @@ pub fn resolve_damage(
             hp.0 -= incoming;
         }
         if hp.0 <= 0.0 {
+            events.deaths.push(DeathEvent {
+                entity: e,
+                team: *team,
+                kind: *kind,
+                at: *hex,
+            });
             commands.entity(e).despawn();
         }
     }
@@ -364,12 +556,13 @@ pub fn movement(
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     terrain: Res<TerrainMap>,
-    mut units: Query<(&mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
+    mut moved: ResMut<MovedThisTick>,
+    mut units: Query<(Entity, &mut Hex, &Team, &Kind, &Group, &mut NextMove)>,
 ) {
     let now = tick.0;
     let mut reserved: HashSet<(i32, i32)> = HashSet::new();
 
-    for (mut hex, team, kind, group, mut next) in &mut units {
+    for (me, mut hex, team, kind, group, mut next) in &mut units {
         let order = orders.get(*team, group.0);
         if matches!(order, Order::Hold | Order::Idle) {
             continue;
@@ -405,6 +598,7 @@ pub fn movement(
                     if let Some(n) = kite_step(from, e, &terrain, &idx, &reserved) {
                         reserved.insert((n.q, n.r));
                         *hex = n;
+                        moved.0.insert(me);
                         next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
                     }
                     continue;
@@ -433,6 +627,7 @@ pub fn movement(
         if let Some(n) = step {
             reserved.insert((n.q, n.r));
             *hex = n;
+            moved.0.insert(me);
             next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
         }
     }
@@ -618,6 +813,40 @@ pub fn enemy_ai(units: Query<(&Hex, &Team)>, idx: Res<SpatialIndex>, mut orders:
 }
 
 // ---------------------------------------------------------------------------
+// Animation state machine — runs last, after combat/damage/movement have
+// settled, and labels each surviving unit with what it did this tick. Dead
+// units are already despawned (their death is a `DeathEvent`).
+// ---------------------------------------------------------------------------
+
+/// Recompute every unit's [`AnimState`] from this tick's outcome. Priority,
+/// highest first: **Attack** (it dealt damage) > **Hit** (it took damage) >
+/// **Move** (it stepped) > **Idle**. Attack outranks Hit so a unit locked in
+/// melee — which both deals and takes damage every tick — reads as attacking
+/// rather than perpetually flinching.
+pub fn animate(
+    events: Res<BattleEvents>,
+    moved: Res<MovedThisTick>,
+    dmg: Res<DamageBuffer>,
+    mut units: Query<(Entity, &mut AnimState)>,
+) {
+    let attackers: HashSet<Entity> = events.attacks.iter().map(|a| a.attacker).collect();
+    for (e, mut anim) in &mut units {
+        let next = if attackers.contains(&e) {
+            AnimState::Attack
+        } else if dmg.0.get(&e).is_some_and(|d| *d > 0.0) {
+            AnimState::Hit
+        } else if moved.0.contains(&e) {
+            AnimState::Move
+        } else {
+            AnimState::Idle
+        };
+        if *anim != next {
+            *anim = next;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Headless driver — used by tests and re-used by the game's tick.
 // ---------------------------------------------------------------------------
 
@@ -631,6 +860,7 @@ pub fn step(world: &mut World) {
             combat,
             resolve_damage,
             movement,
+            animate,
         )
             .chain(),
     );
@@ -648,6 +878,8 @@ mod tests {
         w.insert_resource(TerrainMap::default());
         w.insert_resource(SpatialIndex::default());
         w.insert_resource(DamageBuffer::default());
+        w.insert_resource(BattleEvents::default());
+        w.insert_resource(MovedThisTick::default());
         w
     }
 
@@ -895,5 +1127,163 @@ mod tests {
             }
         }
         assert!(red == 0 || blue == 0, "one side should be wiped: red={red} blue={blue}");
+    }
+
+    // --- Animation state machine + events -------------------------------
+
+    #[test]
+    fn attacking_units_enter_the_attack_state_and_log_an_event() {
+        let mut w = fresh_world();
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1)).id();
+
+        step(&mut w);
+
+        // Both are locked in melee: each deals damage, so each reads as Attack
+        // (Attack outranks Hit).
+        assert_eq!(*w.get::<AnimState>(red).unwrap(), AnimState::Attack);
+        assert_eq!(*w.get::<AnimState>(blue).unwrap(), AnimState::Attack);
+
+        let ev = w.resource::<BattleEvents>();
+        assert!(
+            ev.attacks.contains(&AttackEvent {
+                attacker: red,
+                target: blue,
+                kind: Kind::Infantry,
+                at: Hex::new(0, 0),
+            }),
+            "red→blue strike should be logged: {:?}",
+            ev.attacks
+        );
+    }
+
+    #[test]
+    fn marching_units_enter_the_move_state() {
+        let mut w = fresh_world();
+        // Lone cavalry, no enemy: it marches toward the enemy line.
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        step(&mut w);
+
+        assert_eq!(*w.get::<AnimState>(blue).unwrap(), AnimState::Move);
+    }
+
+    #[test]
+    fn a_struck_survivor_shows_hit_not_move() {
+        let mut w = fresh_world();
+        // Infantry marches at a skirmisher out of its melee reach: it advances
+        // (would be Move) *and* gets shot. Hit must win over Move.
+        let inf = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        let sk = w.spawn(unit(Team::Blue, Kind::Skirmisher, Hex::new(3, 0), 1)).id();
+
+        step(&mut w);
+
+        assert_eq!(*w.get::<AnimState>(inf).unwrap(), AnimState::Hit, "shot melee = Hit");
+        assert_eq!(*w.get::<AnimState>(sk).unwrap(), AnimState::Attack, "shooter = Attack");
+    }
+
+    #[test]
+    fn idle_units_settle_into_the_idle_state() {
+        let mut w = fresh_world();
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        // First tick it marches (Move) — prove the system actively transitions.
+        step(&mut w);
+        assert_eq!(*w.get::<AnimState>(blue).unwrap(), AnimState::Move);
+
+        // Hold it: no movement, no combat → back to Idle.
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Hold);
+        step(&mut w);
+        assert_eq!(*w.get::<AnimState>(blue).unwrap(), AnimState::Idle);
+    }
+
+    #[test]
+    fn death_emits_an_event_with_team_kind_and_position() {
+        let mut w = fresh_world();
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+        // One blue infantry strike is 14 dmg; drop red to a lethal sliver.
+        w.get_mut::<Health>(red).unwrap().0 = 5.0;
+
+        step(&mut w);
+
+        assert!(w.get::<Health>(red).is_none(), "red should be despawned");
+        let deaths = &w.resource::<BattleEvents>().deaths;
+        assert_eq!(
+            deaths,
+            &vec![DeathEvent {
+                entity: red,
+                team: Team::Red,
+                kind: Kind::Infantry,
+                at: Hex::new(0, 0),
+            }],
+            "death event must carry team/kind/position"
+        );
+    }
+
+    #[test]
+    fn per_tick_buffers_reset_between_ticks() {
+        let mut w = fresh_world();
+        w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1));
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1));
+
+        step(&mut w);
+        assert!(!w.resource::<BattleEvents>().attacks.is_empty(), "tick 1 logged attacks");
+
+        // Pull them apart so nothing happens, then tick: the log must clear.
+        let reds: Vec<Entity> = {
+            let mut q = w.query_filtered::<Entity, With<Team>>();
+            q.iter(&w).collect()
+        };
+        for e in reds {
+            if w.get::<Team>(e) == Some(&Team::Blue) {
+                w.get_mut::<Hex>(e).unwrap().q = 40; // far away
+            }
+        }
+        w.resource_mut::<Orders>().set(Team::Red, 1, Order::Hold);
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Hold);
+
+        step(&mut w);
+        let ev = w.resource::<BattleEvents>();
+        assert!(ev.attacks.is_empty() && ev.deaths.is_empty(), "buffers must reset each tick");
+        assert!(w.resource::<MovedThisTick>().0.is_empty(), "moved set must reset each tick");
+    }
+
+    // --- Animation asset catalog ----------------------------------------
+
+    #[test]
+    fn catalog_maps_each_kind_and_state_to_a_clip() {
+        let cat = AnimCatalog::default();
+        for kind in [Kind::Infantry, Kind::Cavalry, Kind::Skirmisher] {
+            let v = cat.get(kind);
+            // Every state resolves and the clip lookup matches the field.
+            assert_eq!(v.clip(AnimState::Idle), v.idle);
+            assert_eq!(v.clip(AnimState::Move), v.moving);
+            assert_eq!(v.clip(AnimState::Attack), v.attack);
+            assert_eq!(v.clip(AnimState::Hit), v.hit);
+            assert_eq!(v.clip(AnimState::Die), v.die);
+        }
+    }
+
+    #[test]
+    fn default_catalog_loops_holds_but_not_one_shots() {
+        let v = AnimCatalog::default().get(Kind::Infantry).clone();
+        assert!(v.idle.looping && v.moving.looping, "idle/move should loop");
+        assert!(
+            !v.attack.looping && !v.hit.looping && !v.die.looping,
+            "attack/hit/die should play once"
+        );
+        // Each kind points at a distinct sheet path.
+        let cat = AnimCatalog::default();
+        let paths = [
+            cat.get(Kind::Infantry).sheet.path,
+            cat.get(Kind::Cavalry).sheet.path,
+            cat.get(Kind::Skirmisher).sheet.path,
+        ];
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "kinds should map to distinct sheets: {paths:?}"
+        );
     }
 }

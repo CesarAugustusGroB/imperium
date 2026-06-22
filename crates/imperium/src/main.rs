@@ -10,8 +10,8 @@ use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
-    generate_terrain, unit, DamageBuffer, Group, Health, Hex, Kind, NextMove, Order, Orders,
-    SpatialIndex, Team, Terrain, TerrainMap, Tick,
+    generate_terrain, unit, AnimCatalog, AnimState, BattleEvents, DamageBuffer, Group, Health, Hex,
+    Kind, MovedThisTick, NextMove, Order, Orders, SpatialIndex, Team, Terrain, TerrainMap, Tick,
 };
 
 const HEX_SIZE: f32 = 12.0;
@@ -42,6 +42,7 @@ fn main() {
         .register_type::<Kind>()
         .register_type::<Group>()
         .register_type::<NextMove>()
+        .register_type::<AnimState>()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
         .insert_resource(generate_terrain(SEED, GRID_Q, GRID_R))
         // Battle sim runs on a fixed timestep, decoupled from render framerate.
@@ -50,6 +51,11 @@ fn main() {
         .insert_resource(Orders::default())
         .insert_resource(SpatialIndex::default())
         .insert_resource(DamageBuffer::default())
+        // Animation data layer: per-tick event log + mover set drive AnimState,
+        // and the catalog tells the render crate which clip each state maps to.
+        .insert_resource(BattleEvents::default())
+        .insert_resource(MovedThisTick::default())
+        .insert_resource(AnimCatalog::default())
         .add_systems(Startup, setup)
         .add_systems(
             FixedUpdate,
@@ -60,6 +66,7 @@ fn main() {
                 sim_core::combat,
                 sim_core::resolve_damage,
                 sim_core::movement,
+                sim_core::animate,
                 log_status,
             )
                 .chain(),
