@@ -26,8 +26,18 @@ antes de comprometer el juego entero.
   través de una montaña — apunta al enemigo *visible* más cercano (los extremos no
   cuentan, así que un objetivo parado sobre una montaña sigue siendo disparable).
   Generación determinista por semilla (hash noise, sin deps).
-- **Pathfinding A\*** (hexx): las unidades rutan alrededor de montañas/agua hacia
-  el enemigo visible (greedy en el avance abierto).
+- **Pathfinding y formaciones**: A\* (hexx) rutea alrededor de montañas/agua hacia
+  el enemigo visible, pero el path se **cachea y se recomputa sólo cada N ticks**
+  (no por unidad por tick) para escalar. Sin enemigo a la vista el ejército sigue
+  un **flow-field** (campo de integración Dijkstra compartido hacia la línea
+  enemiga, rodea obstáculos cóncavos que un paso greedy no resuelve). Hay
+  **evasión de bloqueo** (un `sidestep` lateral cuando una unidad queda encajonada
+  por sus propias filas) y **cohesión de formación** (una unidad que se adelanta
+  más de `COHESION_SLACK` del frente de su grupo se frena para que el bloque cierre).
+- **Escala**: índice espacial **denso** (array sobre la caja envolvente, en vez del
+  `HashMap` placeholder) y un escaneo de enemigo cercano **anillo por anillo** con
+  salida temprana. Hay tests de estrés headless (cientos/miles de unidades) que
+  verifican que el tick no panica y el conteo sólo decrece.
 - **Órdenes por grupo** (March / Charge / Hold / Idle / **Retreat** / **Unleash**)
   y **cooldowns** por tipo: charge pega más y va más rápido, hold reduce daño,
   **retreat** se repliega alejándose del enemigo hacia la línea propia, y
@@ -35,8 +45,23 @@ antes de comprometer el juego entero.
   skirmishers dejan de *kitear* para entrar al cuerpo a cuerpo).
 - Controles: **`1`** March · **`2`** Charge · **`3`** Hold · **`4`** Retreat ·
   **`5`** Unleash (todos para Red, grupo 1).
+- **Combate**: cada unidad lanza **un** ataque por tick. En melee enfoca al enemigo
+  adyacente más débil (*focus fire*, asegura bajas) y el golpe se **amplifica por
+  flanqueo** (más atacantes rodeando al mismo objetivo → más daño; rodear es letal).
+  Los skirmishers disparan a distancia (sin bonus de flanqueo).
+- **Stamina / fatiga**: la agresión sostenida cuesta. Cargar/*unleash* drena stamina;
+  *hold*/idle la recupera. Una unidad *winded* (stamina baja) pierde su **bonus de
+  carga** — una carga larga deja de rendir y conviene rotar tropas frescas. No toca
+  el daño base.
+- **Capa de animación (datos)**: cada unidad lleva un `AnimState`
+  (idle/move/attack/hit/die) recomputado por tick; el sim emite `AttackEvent` /
+  `DeathEvent` en `BattleEvents` y un `AnimCatalog` tipado mapea `(Kind, AnimState)`
+  a frames — el arte queda para el humano, el esquema es el contrato.
+- **Determinismo**: el tick es bit-a-bit reproducible (test de propiedad), la
+  matemática de balance de la IA no desborda a escala de millones, y casos límite
+  (mundo vacío, unidad totalmente amurallada) tickean sin panic.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  15 tests).
+  59 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
@@ -120,13 +145,13 @@ $msgs | & target\debug\imperium-mcp.exe
 
 ## Pendiente
 
-- **A\* a escala**: hoy se corre A* por unidad por tick (target dentro de VISION).
-  Para miles hay que throttlear/cachear el path o usar flow-fields.
+- **Render de animaciones**: la *capa de datos* ya está (`AnimState` + eventos +
+  `AnimCatalog`); falta que el crate `imperium` consuma el catálogo y dibuje los
+  sprite-sheets (hoy las paths del catálogo son placeholders, falta el arte).
 - `bevy_ecs_tilemap` para tiles texturizados — diferido a cuando haya arte (necesita
   atlas; el grid de mallas coloreadas alcanza por ahora).
-- Spatial index linked-list sobre arrays (el `HashMap` actual es el placeholder; el
-  cambio importa al empujar a miles).
-- IA enemiga (behavior tree), BRP/MCP para manejar el juego desde agentes; Steamworks.
+- IA enemiga más rica (behavior tree, órdenes por grupo en vez de army-level);
+  Steamworks.
 
 ## Notas de diseño
 
