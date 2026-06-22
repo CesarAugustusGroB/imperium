@@ -156,6 +156,14 @@ pub struct Group(pub u8);
 #[reflect(Component)]
 pub struct NextMove(pub u64);
 
+/// Stamina (0..=`MAX_STAMINA`). Sustained aggression burns it; resting (Hold/
+/// Idle) restores it. A *winded* unit (below `WINDED`) loses its charge punch,
+/// so a charge that runs too long stops paying off and you must rotate fresh
+/// troops. Models the cost of all-out attacks without touching base combat.
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
+pub struct Stamina(pub f32);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Order {
     Idle,
@@ -168,6 +176,31 @@ pub const HOLD_REDUCTION: f32 = 0.5;
 pub const VISION: i32 = 8;
 /// A skirmisher within this many hexes of an enemy backs off instead of meleeing.
 pub const KITE_THRESHOLD: i32 = 2;
+
+/// Full stamina; every unit starts here.
+pub const MAX_STAMINA: f32 = 100.0;
+/// Stamina lost per tick while charging.
+pub const CHARGE_DRAIN: f32 = 10.0;
+/// Stamina recovered per tick while resting (Hold/Idle).
+pub const REST_REGEN: f32 = 12.0;
+/// Stamina recovered per tick while marching (lighter than full rest).
+pub const MARCH_REGEN: f32 = 4.0;
+/// Below this, a unit is *winded* and loses its charge bonus.
+pub const WINDED: f32 = 25.0;
+
+/// A winded unit can no longer summon a charge's extra punch.
+pub fn is_winded(stamina: Stamina) -> bool {
+    stamina.0 < WINDED
+}
+
+/// Per-tick stamina change for an order: charging drains, resting restores.
+pub fn stamina_delta(order: Order) -> f32 {
+    match order {
+        Order::Charge => -CHARGE_DRAIN,
+        Order::Hold | Order::Idle => REST_REGEN,
+        Order::March => MARCH_REGEN,
+    }
+}
 
 /// Hexes a unit can strike: melee = 1, skirmishers shoot at range.
 pub fn attack_range(kind: Kind) -> i32 {
@@ -223,7 +256,15 @@ fn move_period(kind: Kind, order: Order) -> u64 {
 /// Component bundle for one unit. Shared by the headless tests and the Bevy
 /// game (which adds render components alongside it on the same entity).
 pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
-    (hex, Health(max_hp(kind)), team, kind, Group(group), NextMove(0))
+    (
+        hex,
+        Health(max_hp(kind)),
+        team,
+        kind,
+        Group(group),
+        NextMove(0),
+        Stamina(MAX_STAMINA),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +316,16 @@ pub fn tick_and_clear(mut tick: ResMut<Tick>, mut dmg: ResMut<DamageBuffer>) {
     dmg.0.clear();
 }
 
+/// Drain stamina from charging units and restore it to resting ones, clamped to
+/// `0..=MAX_STAMINA`. Runs before combat so a unit's fatigue this tick reflects
+/// the order it is carrying out.
+pub fn update_stamina(orders: Res<Orders>, mut units: Query<(&Team, &Group, &mut Stamina)>) {
+    for (team, group, mut stamina) in &mut units {
+        let order = orders.get(*team, group.0);
+        stamina.0 = (stamina.0 + stamina_delta(order)).clamp(0.0, MAX_STAMINA);
+    }
+}
+
 pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<SpatialIndex>) {
     idx.cells.clear();
     for (e, h, t) in &units {
@@ -285,14 +336,16 @@ pub fn build_spatial_index(units: Query<(Entity, &Hex, &Team)>, mut idx: ResMut<
 /// Melee units damage every adjacent enemy; skirmishers shoot the nearest enemy
 /// within missile range. Charging melee attackers hit harder.
 pub fn combat(
-    units: Query<(&Hex, &Team, &Kind, &Group)>,
+    units: Query<(&Hex, &Team, &Kind, &Group, &Stamina)>,
     orders: Res<Orders>,
     idx: Res<SpatialIndex>,
     mut dmg: ResMut<DamageBuffer>,
 ) {
-    for (hex, team, kind, group) in &units {
+    for (hex, team, kind, group, stamina) in &units {
         let order = orders.get(*team, group.0);
-        let amount = attack_damage(*kind) + charge_bonus(*kind, order);
+        // A winded unit still attacks, but can't muster the charge's extra hit.
+        let bonus = if is_winded(*stamina) { 0.0 } else { charge_bonus(*kind, order) };
+        let amount = attack_damage(*kind) + bonus;
         if attack_range(*kind) == 1 {
             for n in hex.neighbors() {
                 if let Some((enemy, eteam)) = idx.at(n) {
@@ -574,6 +627,7 @@ pub fn step(world: &mut World) {
     schedule.add_systems(
         (
             tick_and_clear,
+            update_stamina,
             build_spatial_index,
             combat,
             resolve_damage,
@@ -771,5 +825,61 @@ mod tests {
             }
         }
         assert!(red == 0 || blue == 0, "one side should be wiped: red={red} blue={blue}");
+    }
+
+    #[test]
+    fn sustained_charging_winds_a_unit() {
+        let mut w = fresh_world();
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Charge);
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        let start = w.get::<Stamina>(blue).expect("blue alive").0;
+        for _ in 0..20 {
+            step(&mut w);
+        }
+        let end = w.get::<Stamina>(blue).expect("blue alive").0;
+
+        assert!(end < start, "charging should drain stamina ({start} -> {end})");
+        assert!(is_winded(Stamina(end)), "20 ticks of charging should leave it winded ({end})");
+    }
+
+    #[test]
+    fn resting_recovers_stamina() {
+        let mut w = fresh_world();
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Hold);
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+        w.get_mut::<Stamina>(blue).expect("blue alive").0 = 0.0;
+
+        for _ in 0..10 {
+            step(&mut w);
+        }
+
+        let s = w.get::<Stamina>(blue).expect("blue alive").0;
+        assert!(!is_winded(Stamina(s)), "a held unit should recover out of the winded band ({s})");
+    }
+
+    #[test]
+    fn winded_chargers_lose_their_charge_bonus() {
+        // A fresh charger lands its charge bonus; an exhausted one only its base
+        // hit. Same setup, only the attacker's stamina differs.
+        let dmg = |stamina: f32| -> f32 {
+            let mut w = fresh_world();
+            w.resource_mut::<Orders>().set(Team::Red, 1, Order::Charge);
+            let red = w.spawn(unit(Team::Red, Kind::Cavalry, Hex::new(0, 0), 1)).id();
+            w.get_mut::<Stamina>(red).expect("red alive").0 = stamina;
+            let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1)).id();
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(blue).expect("blue alive").0
+        };
+
+        let fresh = dmg(MAX_STAMINA);
+        let winded = dmg(5.0);
+        assert!(
+            winded < fresh,
+            "a winded charger should lose its charge bonus (fresh={fresh}, winded={winded})"
+        );
+        // The winded charger still deals its base damage — fatigue gates the
+        // bonus, not the attack itself.
+        assert_eq!(winded, attack_damage(Kind::Cavalry), "base damage must still land");
     }
 }

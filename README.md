@@ -25,9 +25,13 @@ antes de comprometer el juego entero.
   el enemigo visible (greedy en el avance abierto).
 - **Órdenes por grupo** (March / Charge / Hold / Idle) y **cooldowns** por tipo;
   charge pega más, hold reduce daño.
+- **Stamina / fatiga**: la agresión sostenida cuesta. Cargar drena stamina;
+  *hold*/idle la recupera (marchar, un poco). Una unidad *winded* (stamina baja)
+  pierde su **bonus de carga** — una carga que se alarga deja de rendir y conviene
+  rotar tropas frescas. No toca el daño base: sólo condiciona el extra de la carga.
 - Controles: **`1`** Red March · **`2`** Red Charge · **`3`** Red Hold.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  11 tests).
+  14 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 

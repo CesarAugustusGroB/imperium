@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
     generate_terrain, unit, DamageBuffer, Group, Health, Hex, Kind, NextMove, Order, Orders,
-    SpatialIndex, Team, Terrain, TerrainMap, Tick,
+    SpatialIndex, Stamina, Team, Terrain, TerrainMap, Tick,
 };
 
 const HEX_SIZE: f32 = 12.0;
@@ -42,6 +42,7 @@ fn main() {
         .register_type::<Kind>()
         .register_type::<Group>()
         .register_type::<NextMove>()
+        .register_type::<Stamina>()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
         .insert_resource(generate_terrain(SEED, GRID_Q, GRID_R))
         // Battle sim runs on a fixed timestep, decoupled from render framerate.
@@ -55,6 +56,7 @@ fn main() {
             FixedUpdate,
             (
                 sim_core::tick_and_clear,
+                sim_core::update_stamina,
                 sim_core::build_spatial_index,
                 sim_core::enemy_ai,
                 sim_core::combat,
