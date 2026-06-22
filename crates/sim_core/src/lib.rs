@@ -247,6 +247,10 @@ pub const HOLD_REDUCTION: f32 = 0.5;
 pub const VISION: i32 = 8;
 /// A skirmisher within this many hexes of an enemy backs off instead of meleeing.
 pub const KITE_THRESHOLD: i32 = 2;
+/// Extra melee damage fraction per *additional* attacker pinning the same target.
+/// Surrounding a defender (a flank/encirclement) makes every attacker hit harder,
+/// so concentration of force pays off — a classic hex-tactics mechanic.
+pub const FLANK_BONUS: f32 = 0.15;
 
 /// Ticks an A\* path stays cached before it is recomputed. The README's
 /// scalability item: rather than running A\* per unit *per tick*, each unit
@@ -728,7 +732,9 @@ pub fn build_formations(units: Query<(&Hex, &Team, &Group)>, mut formations: Res
 /// Single-targeting is what makes flanking matter: a surrounded unit is struck by
 /// every neighbor but only strikes back at one, so being outnumbered in melee is
 /// lethal. (Previously a unit dealt its full damage to all six neighbors at once,
-/// which perversely rewarded being surrounded.)
+/// which perversely rewarded being surrounded.) A melee blow is further amplified
+/// when allies pin the same target from other sides (see [`flank_multiplier`]);
+/// ranged fire is unaffected — flanking is a melee positional mechanic.
 pub fn combat(
     units: Query<(Entity, &Hex, &Team, &Kind, &Group)>,
     healths: Query<&Health>,
@@ -741,13 +747,21 @@ pub fn combat(
     for (me, hex, team, kind, group) in &units {
         let order = orders.get(*team, group.0);
         let amount = attack_damage(*kind) + charge_bonus(*kind, order);
-        let target = if attack_range(*kind) == 1 {
-            weakest_adjacent_enemy(hex, *team, &idx, &healths)
+        let (target, blow) = if attack_range(*kind) == 1 {
+            // Melee: focus the weakest adjacent foe; amplify when allies flank it.
+            match weakest_adjacent_enemy(hex, *team, &idx, &healths) {
+                Some((e, ehex)) => (Some(e), amount * flank_multiplier(&idx, ehex, *team)),
+                None => (None, amount),
+            }
         } else {
-            nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind), &terrain)
+            // Ranged: shoot the nearest enemy in line of sight (no flank bonus).
+            (
+                nearest_enemy_entity(&idx, *hex, *team, attack_range(*kind), &terrain),
+                amount,
+            )
         };
         if let Some(enemy) = target {
-            *dmg.0.entry(enemy).or_insert(0.0) += amount;
+            *dmg.0.entry(enemy).or_insert(0.0) += blow;
             events.attacks.push(AttackEvent {
                 attacker: me,
                 target: enemy,
@@ -758,15 +772,15 @@ pub fn combat(
     }
 }
 
-/// Lowest-HP enemy in one of `hex`'s six neighbors, or `None`. Ties break by the
-/// fixed neighbor order, so the choice is deterministic.
+/// Lowest-HP enemy in one of `hex`'s six neighbors, with its hex, or `None`. Ties
+/// break by the fixed neighbor order, so the choice is deterministic.
 fn weakest_adjacent_enemy(
     hex: &Hex,
     team: Team,
     idx: &SpatialIndex,
     healths: &Query<&Health>,
-) -> Option<Entity> {
-    let mut target: Option<Entity> = None;
+) -> Option<(Entity, Hex)> {
+    let mut target: Option<(Entity, Hex)> = None;
     let mut best_hp = f32::INFINITY;
     for n in hex.neighbors() {
         if let Some((enemy, eteam)) = idx.at(n) {
@@ -774,12 +788,27 @@ fn weakest_adjacent_enemy(
                 let hp = healths.get(enemy).map(|h| h.0).unwrap_or(f32::INFINITY);
                 if hp < best_hp {
                     best_hp = hp;
-                    target = Some(enemy);
+                    target = Some((enemy, n));
                 }
             }
         }
     }
     target
+}
+
+/// Flanking amplifier for a melee blow landing on `target`. Counts how many of
+/// `attacker_team`'s units are adjacent to the target (the attackers ganging up
+/// on it) and grants [`FLANK_BONUS`] per *extra* attacker beyond the first. A
+/// lone attacker gets 1.0 (no bonus); a fully surrounded defender (6 attackers)
+/// caps at `1 + 5 * FLANK_BONUS`. Deterministic: it reads only the rebuilt
+/// spatial index, independent of unit iteration order.
+fn flank_multiplier(idx: &SpatialIndex, target: Hex, attacker_team: Team) -> f32 {
+    let attackers = target
+        .neighbors()
+        .iter()
+        .filter(|n| matches!(idx.at(**n), Some((_, t)) if t == attacker_team))
+        .count();
+    1.0 + FLANK_BONUS * attackers.saturating_sub(1) as f32
 }
 
 /// Apply accumulated damage; defenders on protective terrain and Hold orders
@@ -1384,7 +1413,8 @@ mod tests {
     #[test]
     fn surrounded_unit_takes_more_than_it_deals() {
         // A lone unit ringed by six enemies is struck by all of them but strikes
-        // back at only one — flanking is lethal.
+        // back at only one — and with flanking the six blows are amplified enough
+        // to kill it outright in the first tick, so it may already be despawned.
         let mut w = fresh_world();
         let victim = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
         let ring: Vec<Entity> = Hex::new(0, 0)
@@ -1400,7 +1430,8 @@ mod tests {
             .iter()
             .map(|e| max - w.get::<Health>(*e).map(|h| h.0).unwrap_or(0.0))
             .sum();
-        let taken = max - w.get::<Health>(victim).expect("victim alive").0;
+        // Treat a despawned victim as having taken its full HP (it died).
+        let taken = max - w.get::<Health>(victim).map(|h| h.0).unwrap_or(0.0);
         assert_eq!(dealt, attack_damage(Kind::Infantry), "victim strikes back at exactly one foe");
         assert!(taken > dealt, "a surrounded unit takes far more than it deals (took {taken}, dealt {dealt})");
     }
@@ -1508,6 +1539,49 @@ mod tests {
             dmg_on(Terrain::Hill) < dmg_on(Terrain::Plains),
             "defending on a hill should reduce damage taken"
         );
+    }
+
+    #[test]
+    fn flanking_amplifies_each_melee_blow() {
+        // One red attacker on an isolated blue → the per-attacker baseline.
+        let lone = {
+            let mut w = fresh_world();
+            let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(blue).expect("blue alive").0
+        };
+
+        // Two reds on opposite sides of one blue: each blow is flanked, so the
+        // total exceeds 2× the lone baseline (proving the bonus, not just the
+        // extra attacker).
+        let flanked = {
+            let mut w = fresh_world();
+            let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(1, 0), 1));
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(-1, 0), 1));
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(blue).expect("blue alive").0
+        };
+
+        assert!(lone > 0.0, "lone attacker should deal damage");
+        assert!(
+            flanked > 2.0 * lone,
+            "two flanking attackers ({flanked}) should exceed 2× a lone blow ({lone})"
+        );
+        // Exactly the modeled amount: 2 attackers × (1 + FLANK_BONUS) × base.
+        let expected = 2.0 * (1.0 + FLANK_BONUS) * lone;
+        assert!(
+            (flanked - expected).abs() < 1e-3,
+            "flanked damage {flanked} should match modeled {expected}"
+        );
+    }
+
+    #[test]
+    fn lone_attacker_gets_no_flank_bonus() {
+        let idx = SpatialIndex::default();
+        // Empty index → no attackers adjacent → multiplier is the 1.0 floor.
+        assert_eq!(flank_multiplier(&idx, Hex::new(0, 0), Team::Red), 1.0);
     }
 
     #[test]
