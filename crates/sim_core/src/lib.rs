@@ -35,6 +35,28 @@ impl Hex {
         DIRS.map(|(dq, dr)| Hex::new(self.q + dq, self.r + dr))
     }
 
+    /// The [`DIRS`] index (0..6) of the heading from `self` toward `other` — the
+    /// neighbor of `self` that lands closest to `other`. `None` when they are the
+    /// same hex (no heading). Works for any range, not just adjacency, so a
+    /// skirmisher faces a foe several hexes away. Deterministic: ties resolve to
+    /// the lowest index by the fixed `DIRS` order.
+    pub fn direction_to(self, other: Hex) -> Option<u8> {
+        if self == other {
+            return None;
+        }
+        let mut best = 0u8;
+        let mut best_d = i32::MAX;
+        for (i, (dq, dr)) in DIRS.iter().enumerate() {
+            let step = Hex::new(self.q + dq, self.r + dr);
+            let d = step.distance(other);
+            if d < best_d {
+                best_d = d;
+                best = i as u8;
+            }
+        }
+        Some(best)
+    }
+
     /// Axial hex distance.
     pub fn distance(self, o: Hex) -> i32 {
         ((self.q - o.q).abs() + (self.q + self.r - o.q - o.r).abs() + (self.r - o.r).abs()) / 2
@@ -218,6 +240,16 @@ pub enum AnimState {
     Die,
 }
 
+/// Which of the six hex directions a unit currently looks toward, as an index
+/// into [`DIRS`] (0..6). Recomputed each tick (see [`face`]): a unit faces its
+/// target when it attacks, otherwise the way it just stepped, and holds its last
+/// heading when it does neither. The render crate keys directional sprites off
+/// this — `sim_core` only tracks the heading, it never renders. Starts at `0`
+/// (`DIRS[0]` = +q / "east"), an arbitrary but deterministic default.
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[reflect(Component)]
+pub struct Facing(pub u8);
+
 /// Stamina (0..=`MAX_STAMINA`). Sustained aggression burns it; resting (Hold/
 /// Idle) restores it. A *winded* unit (below `WINDED`) loses its charge punch,
 /// so a charge that runs too long stops paying off and you must rotate fresh
@@ -384,6 +416,7 @@ pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
         Group(group),
         NextMove(0),
         AnimState::default(),
+        Facing::default(),
         PathCache::default(),
         Stamina(MAX_STAMINA),
     )
@@ -398,13 +431,16 @@ pub fn unit(team: Team, kind: Kind, hex: Hex, group: u8) -> impl Bundle {
 // ---------------------------------------------------------------------------
 
 /// One unit struck another this tick (pre-mitigation). `at` is the attacker's
-/// hex — enough for a render layer to spawn a swing/missile effect.
+/// hex and `target_at` the struck hex — together they give a render layer the
+/// full trajectory, enough to draw a melee swing or fly a missile from shooter
+/// to target (and to orient the attacker, see [`Facing`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttackEvent {
     pub attacker: Entity,
     pub target: Entity,
     pub kind: Kind,
     pub at: Hex,
+    pub target_at: Hex,
 }
 
 /// A unit died this tick. Carries team/kind/hex because the entity is despawned
@@ -799,7 +835,7 @@ pub fn combat(
         let (target, blow) = if attack_range(*kind) == 1 {
             // Melee: focus the weakest adjacent foe; amplify when allies flank it.
             match weakest_adjacent_enemy(hex, *team, &idx, &healths) {
-                Some((e, ehex)) => (Some(e), amount * flank_multiplier(&idx, ehex, *team)),
+                Some((e, ehex)) => (Some((e, ehex)), amount * flank_multiplier(&idx, ehex, *team)),
                 None => (None, amount),
             }
         } else {
@@ -809,13 +845,14 @@ pub fn combat(
                 amount,
             )
         };
-        if let Some(enemy) = target {
+        if let Some((enemy, enemy_hex)) = target {
             *dmg.0.entry(enemy).or_insert(0.0) += blow;
             events.attacks.push(AttackEvent {
                 attacker: me,
                 target: enemy,
                 kind: *kind,
                 at: *hex,
+                target_at: enemy_hex,
             });
         }
     }
@@ -911,12 +948,13 @@ pub fn movement(
         &Group,
         &mut NextMove,
         &mut PathCache,
+        &mut Facing,
     )>,
 ) {
     let now = tick.0;
     let mut reserved: HashSet<(i32, i32)> = HashSet::new();
 
-    for (me, mut hex, team, kind, group, mut next, mut cache) in &mut units {
+    for (me, mut hex, team, kind, group, mut next, mut cache, mut facing) in &mut units {
         let order = orders.get(*team, group.0);
         if matches!(order, Order::Hold | Order::Idle) {
             continue;
@@ -938,6 +976,7 @@ pub fn movement(
             };
             if let Some(n) = step {
                 reserved.insert((n.q, n.r));
+                facing.0 = from.direction_to(n).unwrap_or(facing.0);
                 *hex = n;
                 moved.0.insert(me);
                 next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
@@ -952,6 +991,7 @@ pub fn movement(
                 if from.distance(e) <= KITE_THRESHOLD {
                     if let Some(n) = kite_step(from, e, &terrain, &idx, &reserved) {
                         reserved.insert((n.q, n.r));
+                        facing.0 = from.direction_to(n).unwrap_or(facing.0);
                         *hex = n;
                         moved.0.insert(me);
                         next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
@@ -1005,6 +1045,7 @@ pub fn movement(
 
         if let Some(n) = step {
             reserved.insert((n.q, n.r));
+            facing.0 = from.direction_to(n).unwrap_or(facing.0);
             *hex = n;
             moved.0.insert(me);
             next.0 = now + move_period(*kind, order) * terrain.get(n).move_cost();
@@ -1171,7 +1212,7 @@ fn nearest_enemy_entity(
     team: Team,
     range: i32,
     terrain: &TerrainMap,
-) -> Option<Entity> {
+) -> Option<(Entity, Hex)> {
     let mut best = None;
     let mut best_d = i32::MAX;
     for dq in -range..=range {
@@ -1184,7 +1225,7 @@ fn nearest_enemy_entity(
             if let Some((e, t)) = idx.at(h) {
                 if t != team && d < best_d && line_of_sight(from, h, terrain) {
                     best_d = d;
-                    best = Some(e);
+                    best = Some((e, h));
                 }
             }
         }
@@ -1359,6 +1400,23 @@ pub fn animate(
     }
 }
 
+/// Override an attacker's [`Facing`] to point at the foe it struck. Runs after
+/// [`movement`], so an attack heading wins over a step heading — a kiting
+/// skirmisher that shoots then backs away still *faces* the enemy it shot, which
+/// matches the `Attack`-over-`Move` priority in [`animate`]. Units that neither
+/// attacked nor moved keep their previous heading (set in [`movement`] / earlier
+/// ticks). Uses only the event log's `at`/`target_at`, so it never depends on
+/// post-movement positions or surviving target entities.
+pub fn face(events: Res<BattleEvents>, mut units: Query<&mut Facing>) {
+    for a in &events.attacks {
+        if let Some(dir) = a.at.direction_to(a.target_at) {
+            if let Ok(mut facing) = units.get_mut(a.attacker) {
+                facing.0 = dir;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Headless driver — used by tests and re-used by the game's tick.
 // ---------------------------------------------------------------------------
@@ -1377,6 +1435,7 @@ pub fn step(world: &mut World) {
             resolve_damage,
             movement,
             animate,
+            face,
         )
             .chain(),
     );
@@ -2184,6 +2243,7 @@ mod tests {
                 target: blue,
                 kind: Kind::Infantry,
                 at: Hex::new(0, 0),
+                target_at: Hex::new(1, 0),
             }),
             "red→blue strike should be logged: {:?}",
             ev.attacks
@@ -2280,6 +2340,130 @@ mod tests {
         let ev = w.resource::<BattleEvents>();
         assert!(ev.attacks.is_empty() && ev.deaths.is_empty(), "buffers must reset each tick");
         assert!(w.resource::<MovedThisTick>().0.is_empty(), "moved set must reset each tick");
+    }
+
+    // --- Facing (directional heading) + attack trajectory ---------------
+
+    #[test]
+    fn direction_to_is_none_for_self_and_exact_for_neighbors() {
+        let o = Hex::new(0, 0);
+        assert_eq!(o.direction_to(o), None, "no heading to oneself");
+        // Each neighbor resolves to its own DIRS index.
+        for (i, n) in o.neighbors().iter().enumerate() {
+            assert_eq!(o.direction_to(*n), Some(i as u8), "neighbor {n:?} → dir {i}");
+        }
+        // A far target resolves to the neighbor that lands closest to it.
+        let far = Hex::new(5, 0);
+        let dir = o.direction_to(far).expect("a heading exists");
+        let (dq, dr) = DIRS[dir as usize];
+        let stepped = Hex::new(o.q + dq, o.r + dr);
+        assert!(
+            stepped.distance(far) < o.distance(far),
+            "the chosen heading must reduce distance to the target"
+        );
+    }
+
+    #[test]
+    fn units_face_the_direction_they_step() {
+        // A lone marcher with no enemy: its Facing must equal the heading of the
+        // single hex it stepped onto this tick.
+        let mut w = fresh_world();
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+        let before = *w.get::<Hex>(blue).unwrap();
+
+        step(&mut w);
+
+        let after = *w.get::<Hex>(blue).unwrap();
+        let f = w.get::<Facing>(blue).unwrap().0;
+        assert_ne!(after, before, "the unit should have stepped");
+        let (dq, dr) = DIRS[f as usize];
+        assert_eq!(
+            Hex::new(before.q + dq, before.r + dr),
+            after,
+            "Facing must point along the step it took (from {before:?} to {after:?})"
+        );
+    }
+
+    #[test]
+    fn attacking_units_face_their_target() {
+        let mut w = fresh_world();
+        let red = w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(0, 0), 1)).id();
+        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(1, 0), 1)).id();
+
+        step(&mut w);
+
+        assert_eq!(
+            w.get::<Facing>(red).unwrap().0,
+            Hex::new(0, 0).direction_to(Hex::new(1, 0)).unwrap(),
+            "red should face the foe to its +q side"
+        );
+        assert_eq!(
+            w.get::<Facing>(blue).unwrap().0,
+            Hex::new(1, 0).direction_to(Hex::new(0, 0)).unwrap(),
+            "blue should face the foe to its -q side"
+        );
+    }
+
+    #[test]
+    fn attack_facing_overrides_movement_facing() {
+        // A skirmisher both shoots an enemy (range) and kites away from it the
+        // same tick. Its Facing must point at the enemy it shot, not the way it
+        // fled — mirroring the Attack-over-Move priority of the anim state.
+        let mut w = fresh_world();
+        let sk = w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1)).id();
+        w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(2, 0), 1));
+
+        step(&mut w);
+
+        let after = *w.get::<Hex>(sk).unwrap();
+        assert!(
+            after.distance(Hex::new(2, 0)) > 2,
+            "the skirmisher should have kited away, at {after:?}"
+        );
+        assert_eq!(
+            w.get::<Facing>(sk).unwrap().0,
+            Hex::new(0, 0).direction_to(Hex::new(2, 0)).unwrap(),
+            "facing must point at the foe it shot, overriding the kite heading"
+        );
+    }
+
+    #[test]
+    fn a_ranged_attack_event_carries_the_full_trajectory() {
+        let mut w = fresh_world();
+        let sk = w.spawn(unit(Team::Red, Kind::Skirmisher, Hex::new(0, 0), 1)).id();
+        let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(3, 0), 1)).id();
+
+        step(&mut w);
+
+        let ev = w.resource::<BattleEvents>();
+        let shot = ev
+            .attacks
+            .iter()
+            .find(|a| a.attacker == sk)
+            .expect("the skirmisher's shot should be logged");
+        assert_eq!(shot.target, blue);
+        assert_eq!(shot.at, Hex::new(0, 0), "shot originates at the shooter");
+        assert_eq!(shot.target_at, Hex::new(3, 0), "and lands on the target hex");
+    }
+
+    #[test]
+    fn an_idle_unit_keeps_its_last_heading() {
+        // Facing is sticky: a unit that neither moves nor attacks holds the
+        // heading it last set, so a render layer doesn't snap it to a default.
+        let mut w = fresh_world();
+        let blue = w.spawn(unit(Team::Blue, Kind::Cavalry, Hex::new(10, 0), 1)).id();
+
+        step(&mut w); // marches, sets a heading
+        let heading = w.get::<Facing>(blue).unwrap().0;
+
+        w.resource_mut::<Orders>().set(Team::Blue, 1, Order::Hold);
+        step(&mut w); // stands still — no move, no attack
+
+        assert_eq!(
+            w.get::<Facing>(blue).unwrap().0,
+            heading,
+            "an idle unit must retain its previous facing"
+        );
     }
 
     // --- Animation asset catalog ----------------------------------------
@@ -2508,7 +2692,7 @@ mod tests {
         idx.set(Hex::new(3, 0), far, Team::Blue);
         assert_eq!(
             nearest_enemy_entity(&idx, Hex::new(0, 0), Team::Red, 3, &TerrainMap::default()),
-            Some(near),
+            Some((near, Hex::new(1, 0))),
             "ranged attack must pick the nearest enemy"
         );
     }
