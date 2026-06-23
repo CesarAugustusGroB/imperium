@@ -10,7 +10,7 @@ use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::remote::{http::RemoteHttpPlugin, RemotePlugin};
 use sim_core::{
-    generate_terrain, unit, AnimCatalog, AnimState, BattleEvents, DamageBuffer, FlowField,
+    generate_terrain, unit, AnimCatalog, AnimState, BattleEvents, DamageBuffer, Facing, FlowField,
     Formations, Group, Health, Hex, Kind, MovedThisTick, NextMove, Order, Orders, SpatialIndex,
     Stamina, Team, Terrain, TerrainMap, Tick,
 };
@@ -44,6 +44,7 @@ fn main() {
         .register_type::<Group>()
         .register_type::<NextMove>()
         .register_type::<AnimState>()
+        .register_type::<Facing>()
         .register_type::<Stamina>()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
         .insert_resource(generate_terrain(SEED, GRID_Q, GRID_R))
@@ -74,6 +75,7 @@ fn main() {
                 sim_core::resolve_damage,
                 sim_core::movement,
                 sim_core::animate,
+                sim_core::face,
                 log_status,
             )
                 .chain(),

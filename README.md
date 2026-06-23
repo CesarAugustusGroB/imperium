@@ -54,14 +54,20 @@ antes de comprometer el juego entero.
   carga** — una carga larga deja de rendir y conviene rotar tropas frescas. No toca
   el daño base.
 - **Capa de animación (datos)**: cada unidad lleva un `AnimState`
-  (idle/move/attack/hit/die) recomputado por tick; el sim emite `AttackEvent` /
-  `DeathEvent` en `BattleEvents` y un `AnimCatalog` tipado mapea `(Kind, AnimState)`
-  a frames — el arte queda para el humano, el esquema es el contrato.
+  (idle/move/attack/hit/die) y un `Facing` (uno de los 6 rumbos hex) recomputados
+  por tick; el sim emite `AttackEvent` / `DeathEvent` en `BattleEvents` y un
+  `AnimCatalog` tipado mapea `(Kind, AnimState)` a frames — el arte queda para el
+  humano, el esquema es el contrato. El **`Facing`** orienta el sprite: una unidad
+  mira hacia donde pisa, y al atacar mira a su objetivo (la prioridad
+  ataque-sobre-movimiento de `AnimState`, así un skirmisher que dispara y *kitea*
+  igual encara al enemigo). El `AttackEvent` lleva `at` **y** `target_at`, la
+  trayectoria completa del golpe — suficiente para volar un proyectil de tirador a
+  blanco.
 - **Determinismo**: el tick es bit-a-bit reproducible (test de propiedad), la
   matemática de balance de la IA no desborda a escala de millones, y casos límite
   (mundo vacío, unidad totalmente amurallada) tickean sin panic.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  59 tests).
+  65 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
