@@ -103,6 +103,13 @@ cargo run -p imperium       # abre la ventana con la batalla
 > las siguientes son rápidas. Para iterar aún más rápido, descomentá la feature
 > `bevy/dynamic_linking` en `crates/imperium/Cargo.toml`.
 
+> ⚠️ **Sandbox sin acceso a crates.io** (agentes web / CI con egress restringido):
+> si `cargo` falla con `static.crates.io … CONNECT tunnel failed, response 403`,
+> el entorno bloquea la descarga de crates y ningún `cargo test` puede correr.
+> El diagnóstico y los arreglos (allowlist `static.crates.io`, pre-warm del
+> registry, o vendoring offline con `scripts/vendor-deps.sh`) están en
+> [`docs/build-environment.md`](docs/build-environment.md).
+
 ## Agentes en runtime (BRP)
 
 Con el juego corriendo, el **Bevy Remote Protocol** expone el ECS por JSON-RPC en
