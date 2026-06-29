@@ -119,6 +119,18 @@ impl Terrain {
     pub fn blocks_sight(self) -> bool {
         matches!(self, Terrain::Mountain)
     }
+    /// Relative height of the terrain, the input to the high-ground melee bonus
+    /// ([`high_ground_multiplier`]). Hills sit above the plain; mountains are
+    /// higher still (defined for completeness — they are impassable, so a unit
+    /// never *stands* on one in normal play). Forest is dense, not tall, so it
+    /// reads as ground level: its edge is cover (a defensive bonus), not height.
+    pub fn elevation(self) -> i32 {
+        match self {
+            Terrain::Mountain => 2,
+            Terrain::Hill => 1,
+            Terrain::Plains | Terrain::Forest | Terrain::Water => 0,
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -259,6 +271,13 @@ pub const KITE_THRESHOLD: i32 = 2;
 /// Surrounding a defender (a flank/encirclement) makes every attacker hit harder,
 /// so concentration of force pays off — a classic hex-tactics mechanic.
 pub const FLANK_BONUS: f32 = 0.15;
+/// Extra melee damage fraction per *level* of height advantage the attacker has
+/// over its target ([`high_ground_multiplier`]). Striking downhill — a cavalry
+/// charge off a hill, infantry pressing down a slope — lands harder; striking
+/// uphill earns nothing. A positional bonus like flanking, so holding the high
+/// ground is worth contesting. Ranged fire is unaffected (it already routes
+/// around line-of-sight); high ground is a melee mechanic here.
+pub const HIGH_GROUND_BONUS: f32 = 0.25;
 
 /// Ticks an A\* path stays cached before it is recomputed. The README's
 /// scalability item: rather than running A\* per unit *per tick*, each unit
@@ -797,9 +816,14 @@ pub fn combat(
         let bonus = if is_winded(*stamina) { 0.0 } else { charge_bonus(*kind, order) };
         let amount = attack_damage(*kind) + bonus;
         let (target, blow) = if attack_range(*kind) == 1 {
-            // Melee: focus the weakest adjacent foe; amplify when allies flank it.
+            // Melee: focus the weakest adjacent foe; amplify when allies flank
+            // it and when we strike from higher ground.
             match weakest_adjacent_enemy(hex, *team, &idx, &healths) {
-                Some((e, ehex)) => (Some(e), amount * flank_multiplier(&idx, ehex, *team)),
+                Some((e, ehex)) => {
+                    let flank = flank_multiplier(&idx, ehex, *team);
+                    let high = high_ground_multiplier(terrain.get(*hex), terrain.get(ehex));
+                    (Some(e), amount * flank * high)
+                }
                 None => (None, amount),
             }
         } else {
@@ -858,6 +882,19 @@ fn flank_multiplier(idx: &SpatialIndex, target: Hex, attacker_team: Team) -> f32
         .filter(|n| matches!(idx.at(**n), Some((_, t)) if t == attacker_team))
         .count();
     1.0 + FLANK_BONUS * attackers.saturating_sub(1) as f32
+}
+
+/// High-ground amplifier for a melee blow: [`HIGH_GROUND_BONUS`] per level the
+/// `attacker`'s terrain rises above the `defender`'s. Equal or lower ground
+/// gives 1.0 (no penalty for fighting uphill — it simply forfeits the bonus).
+/// Pure function of the two tiles' [`Terrain::elevation`], so it is independent
+/// of unit iteration order and trivially deterministic. In normal play units
+/// only stand on passable terrain (Plains/Forest = level 0, Hill = level 1), so
+/// the live cases are "on a hill vs. below" (×`1 + HIGH_GROUND_BONUS`) or even
+/// ground (×1.0); the Mountain level exists only for completeness.
+fn high_ground_multiplier(attacker: Terrain, defender: Terrain) -> f32 {
+    let rise = (attacker.elevation() - defender.elevation()).max(0);
+    1.0 + HIGH_GROUND_BONUS * rise as f32
 }
 
 /// Apply accumulated damage; defenders on protective terrain and Hold orders
@@ -1588,6 +1625,65 @@ mod tests {
         assert!(
             dmg_on(Terrain::Hill) < dmg_on(Terrain::Plains),
             "defending on a hill should reduce damage taken"
+        );
+    }
+
+    #[test]
+    fn elevation_orders_terrain_by_height() {
+        assert!(Terrain::Mountain.elevation() > Terrain::Hill.elevation());
+        assert!(Terrain::Hill.elevation() > Terrain::Plains.elevation());
+        // Forest and water sit at ground level (cover/impassable, not height).
+        assert_eq!(Terrain::Plains.elevation(), Terrain::Forest.elevation());
+        assert_eq!(Terrain::Plains.elevation(), Terrain::Water.elevation());
+    }
+
+    #[test]
+    fn high_ground_multiplier_rewards_only_the_uphill_attacker() {
+        // Striking downhill (attacker above the defender) earns the bonus.
+        assert_eq!(
+            high_ground_multiplier(Terrain::Hill, Terrain::Plains),
+            1.0 + HIGH_GROUND_BONUS
+        );
+        // Striking uphill or on level ground gets the 1.0 floor — no penalty for
+        // low ground, it just forfeits the bonus.
+        assert_eq!(high_ground_multiplier(Terrain::Plains, Terrain::Hill), 1.0);
+        assert_eq!(high_ground_multiplier(Terrain::Plains, Terrain::Plains), 1.0);
+        assert_eq!(high_ground_multiplier(Terrain::Forest, Terrain::Plains), 1.0);
+        // Each level of rise stacks (Mountain over Plains is the completeness case).
+        assert_eq!(
+            high_ground_multiplier(Terrain::Mountain, Terrain::Plains),
+            1.0 + 2.0 * HIGH_GROUND_BONUS
+        );
+    }
+
+    #[test]
+    fn high_ground_amplifies_a_downhill_melee_blow() {
+        // A red attacker on `attacker_tile` strikes a blue defender that always
+        // stands on Plains, so the defender's terrain defense is held constant
+        // and only the attacker's height advantage varies. Measures the damage
+        // the defender takes.
+        let dmg_from = |attacker_tile: Terrain| -> f32 {
+            let mut w = fresh_world();
+            w.resource_mut::<TerrainMap>().set(Hex::new(1, 0), attacker_tile);
+            let blue = w.spawn(unit(Team::Blue, Kind::Infantry, Hex::new(0, 0), 1)).id();
+            w.spawn(unit(Team::Red, Kind::Infantry, Hex::new(1, 0), 1));
+            step(&mut w);
+            max_hp(Kind::Infantry) - w.get::<Health>(blue).expect("blue alive").0
+        };
+
+        let flat = dmg_from(Terrain::Plains);
+        let downhill = dmg_from(Terrain::Hill);
+
+        assert!(flat > 0.0, "attacker should deal damage on flat ground");
+        assert!(
+            downhill > flat,
+            "a downhill blow ({downhill}) should exceed a flat-ground blow ({flat})"
+        );
+        // Exactly the modeled amount: base × (1 + HIGH_GROUND_BONUS).
+        let expected = (1.0 + HIGH_GROUND_BONUS) * flat;
+        assert!(
+            (downhill - expected).abs() < 1e-3,
+            "downhill blow {downhill} should match modeled {expected}"
         );
     }
 
