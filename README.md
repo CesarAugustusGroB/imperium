@@ -21,7 +21,8 @@ antes de comprometer el juego entero.
 - **BRP** (Bevy Remote Protocol): el ECS se expone por JSON-RPC en el puerto 15702;
   un agente puede leer/mutar el juego corriendo (ver sección *Agentes*).
 - **Terreno** con efecto mecánico: montaña/agua intransitables, bosque/colina
-  ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido).
+  ralentizan (mayor cooldown) y dan **bonus defensivo** (menos daño recibido);
+  la **colina** además da **ventaja de altura** en melee (ver *Combate*).
   Las **montañas bloquean la línea de visión**: un skirmisher no puede disparar a
   través de una montaña — apunta al enemigo *visible* más cercano (los extremos no
   cuentan, así que un objetivo parado sobre una montaña sigue siendo disparable).
@@ -47,8 +48,10 @@ antes de comprometer el juego entero.
   **`5`** Unleash (todos para Red, grupo 1).
 - **Combate**: cada unidad lanza **un** ataque por tick. En melee enfoca al enemigo
   adyacente más débil (*focus fire*, asegura bajas) y el golpe se **amplifica por
-  flanqueo** (más atacantes rodeando al mismo objetivo → más daño; rodear es letal).
-  Los skirmishers disparan a distancia (sin bonus de flanqueo).
+  flanqueo** (más atacantes rodeando al mismo objetivo → más daño; rodear es letal)
+  y por **terreno elevado** (pegar *cuesta abajo* desde una colina suma daño;
+  cuesta arriba no penaliza, sólo pierde el bonus — sostener la altura conviene).
+  Los skirmishers disparan a distancia (sin bonus de flanqueo ni de altura).
 - **Stamina / fatiga**: la agresión sostenida cuesta. Cargar/*unleash* drena stamina;
   *hold*/idle la recupera. Una unidad *winded* (stamina baja) pierde su **bonus de
   carga** — una carga larga deja de rendir y conviene rotar tropas frescas. No toca
@@ -61,7 +64,7 @@ antes de comprometer el juego entero.
   matemática de balance de la IA no desborda a escala de millones, y casos límite
   (mundo vacío, unidad totalmente amurallada) tickean sin panic.
 - Toda la lógica vive en `sim_core` (ECS puro sobre `bevy_ecs`, **headless, testeable**:
-  59 tests).
+  62 tests).
 - El binario `imperium` (Bevy) corre el sim a **2 ticks/seg** (fixed timestep) y
   renderiza terreno + unidades; el render solo espeja `Hex → Transform`.
 
